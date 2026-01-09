@@ -37,6 +37,7 @@ fill_map <- group_aes$fill
 color_map <- group_aes$color
 
 group_order <- c("Chow-HFHS","Lactation HFHS-HFHS","Post-weaning  HFHS-HFHS")
+write_xlsx(count_hypo, "read_count_bulk_hypo.xlsx")
 ```
 
 ```{r PCA}
@@ -129,9 +130,127 @@ deg_up_lact <- res_df_lact_chow  %>%
 
 deg_down_lact <- res_df_lact_chow %>%
   filter(padj < 0.05, log2FoldChange < 0)
+deg_up_lact
 ```
 
+```{r lets compare up vs down}
+# UP genes
+up_symbols <- rownames(deg_up_lact)
+up_entrez <- bitr(
+  up_symbols,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)$ENTREZID
 
+# DOWN genes
+down_symbols <- rownames(deg_down_lact)
+down_entrez <- bitr(
+  down_symbols,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)$ENTREZID
+
+go_bp_up <- enrichGO(
+  gene          = up_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+go_bp_down <- enrichGO(
+  gene          = down_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+keywords <- c(
+  "leptin", "insulin", "energy", "feeding", "appetite",
+  "neuropeptide",
+  "JAK", "STAT", 
+  "reticulum", "stress", "unfolded", "protein",
+  "lipid", "inflammation"
+)
+go_bp_up_df <- as.data.frame(go_bp_up)
+go_bp_down_df <- as.data.frame(go_bp_down)
+
+go_bp_up_focus <- go_bp_up_df %>%
+  filter(grepl(paste(keywords, collapse = "|"),
+               Description, ignore.case = TRUE))
+
+go_bp_down_focus <- go_bp_down_df %>%
+  filter(grepl(paste(keywords, collapse = "|"),
+               Description, ignore.case = TRUE))
+
+go_up_plot <- go_bp_up_focus %>%
+  arrange(p.adjust) %>%
+  mutate(
+    Description = factor(Description, levels = rev(Description)),
+    negLogP = -log10(p.adjust)
+  )
+
+go_down_plot <- go_bp_down_focus %>%
+  arrange(p.adjust) %>%
+  mutate(
+    Description = factor(Description, levels = rev(Description)),
+    negLogP = -log10(p.adjust)
+  )
+
+col_up   <- "#C73E1D"   # muted red (stress)
+col_down <- "#2A7FFF"   # soft blue (metabolic down)
+
+p_up <- ggplot(go_up_plot, aes(x = Description, y = negLogP)) +
+  geom_col(fill = col_up, width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Upregulated Biological Processes",
+    subtitle = "Lactation HFHS vs Chow HFHS (Hypothalamus)",
+    x = NULL,
+    y = expression(-log[10]("adjusted p-value"))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_down <- ggplot(go_down_plot, aes(x = Description, y = negLogP)) +
+  geom_col(fill = col_down, width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Downregulated Biological Processes",
+    subtitle = "Lactation HFHS vs Chow HFHS (Hypothalamus)",
+    x = NULL,
+    y = expression(-log[10]("adjusted p-value"))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 15),
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    axis.text.y = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_up + p_down
+
+
+```
 
 ```{r GO BP DEG}
 deg_symbols <- rownames(sig_genes)
@@ -184,7 +303,7 @@ p_cc <- dotplot(go_cc, showCategory = 20) +
 
 p_mf <- dotplot(go_mf, showCategory = 20) +
   ggtitle("GO Molecular Function (DEGs)")
-
+p_bp
 ggsave(
   filename = file.path(out_dir, "GO_BP_dotplot.png"),
   plot = p_bp,
@@ -755,4 +874,75 @@ pheatmap(
   fontsize_col = 10,
   main = "Mean Expression per Group"
 )
+```
+
+
+```{r Leptin-Melanocortin Pathway}
+genes_leptin_melanocortin <- c("Lepr", "Mc4r", "Pcsk1", "Pomc", "Adcy3", "Alms1", "Arnt2", "Bdnf", "Cep19", "Krs2", "Magel2", "Mc3r", "Mrap2", "Myt1l", "Ncoa1", "Ntrk2", "Sh2b1", "Sim1", "Tub")
+count_goi <- count_hypo_filtered[
+  rownames(count_hypo_filtered) %in% genes_leptin_melanocortin,
+  sample_cols,
+  drop = FALSE
+]
+
+sample_info_hypo <- sample_info_hypo[
+  match(colnames(count_goi), sample_info_hypo$sample_name),
+]
+
+group_means <- sapply(group_order, function(g) {
+  samples_in_group <- sample_info_hypo$sample_name[
+    sample_info_hypo$group == g
+  ]
+  
+  rowMeans(count_goi[ , samples_in_group, drop = FALSE])
+})
+
+# convert to matrix
+group_means <- as.matrix(group_means)
+
+scaled_matrix <- t(scale(t(group_means)))
+
+# Colors
+my_colors <- colorRampPalette(c("blue", "white", "red"))(100)
+
+pheatmap(
+  scaled_matrix,
+  cluster_rows = TRUE,       # cluster genes
+  cluster_cols = FALSE,      # keep group order fixed
+  color = my_colors,
+  border_color = NA,
+  fontsize_row = 10,
+  fontsize_col = 12,
+  main = "Leptin-Melanocortin Gene Expression Across Groups",
+  angle_col = 45
+)
+
+# Melt matrix for ggplot
+df_plot <- melt(group_means)
+colnames(df_plot) <- c("Gene", "Group", "Expression")
+
+ggplot(df_plot, aes(x = Gene, y = Expression, fill = Group)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  theme_minimal(base_size = 14) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Average Expression of Leptin-Melanocortin Genes",
+       y = "Expression (counts)", x = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Compute mean per group
+composite_score <- colMeans(group_means)
+
+# Put into dataframe
+df_score <- data.frame(
+  Group = names(composite_score),
+  Score = composite_score
+)
+
+ggplot(df_score, aes(x = Group, y = Score, fill = Group)) +
+  geom_col() +
+  geom_text(aes(label = round(Score, 2)), vjust = -0.5) +
+  theme_minimal(base_size = 14) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title = "Melanocortin Pathway Composite Score per Group",
+       y = "Mean Expression", x = "")
 ```
