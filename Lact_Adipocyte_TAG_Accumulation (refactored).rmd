@@ -1,0 +1,1210 @@
+---
+title: "Lact_Adipocyte_TAG_Accumulation (refactored)"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+# Minimal packages needed across the notebook
+library(dplyr); library(tidyr); library(ggplot2); library(rstatix)
+library(pheatmap); library(clusterProfiler); library(org.Mm.eg.db)
+library(glmnet); library(VennDiagram); library(grid); library(writexl)
+library(VennDiagram);library(forcats);library(ggrepel); library(DESeq2)
+library(reshape2);library(tidyverse); library(AnnotationDbi); library(GO.db)
+library(viridis)
+
+source("R/utils.R")
+
+out_dir <- "output"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(out_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
+
+sample_info <- read.csv("sample_info.csv")
+gene_count <- readxl::read_excel("gene_count_bulk_rna.xlsx")
+
+sample_info <- sample_info %>%
+  mutate(group = recode(group,
+                        "Control" = "Chow-Chow",
+                        "Lactation" = "Lactation HFHS-Chow", 
+                        "Postweaning" = "Post-weaning HFHS-Chow", 
+                        "Ctrl_HFHS" = "Chow-HFHS",
+                        "Lact_HFHS" = "Lactation HFHS-HFHS",
+                        "Pw_HFHS" = "Post-weaning HFHS-HFHS"))
+
+.group_base_colors <- c(
+  "Chow-Chow" = "#000000",
+  "Chow-HFHS" = "#000000",
+  "Lactation HFHS-Chow" = "#de5528",
+  "Lactation HFHS-HFHS" = "#de5528",
+  "Post-weaning HFHS-Chow" = "#208696",
+  "Post-weaning HFHS-HFHS" = "#208696"
+)
+
+
+group_aes <- get_group_aesthetics(names(.group_base_colors))
+fill_map <- group_aes$fill
+color_map <- group_aes$color
+
+group_order <- c("Chow-Chow","Chow-HFHS","Lactation HFHS-Chow","Lactation HFHS-HFHS","Post-weaning HFHS-Chow","Post-weaning HFHS-HFHS")
+```
+
+
+```{r normalize-expression}
+# 1) TMM + log2-CPM (good for visualization / clustering / many DE workflows)
+dge <- DGEList(counts = as.matrix(expr_matrix))
+dge <- calcNormFactors(dge)          # TMM
+expr_tmm_log2cpm <- cpm(dge, log = TRUE, prior.count = 1)
+
+# 2) DESeq2 VST (variance-stabilizing transformation; good for PCA/ML)
+coldata <- sample_info %>% filter(sample_name %in% colnames(expr_matrix)) %>%
+  column_to_rownames("sample_name")
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(expr_matrix)),
+                              colData = coldata,
+                              design = ~ group)
+dds <- estimateSizeFactors(dds)
+vsd <- vst(dds, blind = FALSE)
+expr_vst <- assay(vsd)
+
+# Save normalized matrices for record
+save_df_xlsx(as.data.frame(expr_tmm_log2cpm) %>% tibble::rownames_to_column("Gene"),
+             file.path(out_dir, "tables", "expr_tmm_log2cpm.xlsx"), sheet_name = "tmm_log2cpm")
+save_df_xlsx(as.data.frame(expr_vst) %>% tibble::rownames_to_column("Gene"),
+             file.path(out_dir, "tables", "expr_vst.xlsx"), sheet_name = "vst")
+
+expr_long_melt <- melt_expr(expr_matrix, sample_info, sample_col = "sample_name", group_col = "group")
+
+# Save core tables (raw matrix + long)
+save_df_xlsx(as.data.frame(expr_matrix) %>% tibble::rownames_to_column("Gene"),
+             file.path(out_dir, "tables", "expr_matrix_raw.xlsx"),
+             sheet_name = "expr_matrix")
+write_csv(expr_long_melt,
+             file.path(out_dir, "tables", "expr_long_melt.csv"))
+```
+
+
+
+```{r pairwise-tests, echo=TRUE}
+# Use the exact display names present in your data
+# (replace these strings if your unique() output differs)
+desired_levels <- c(
+  "Lactation HFHS-HFHS",
+  "Lactation HFHS-Chow",
+  "Chow-HFHS",
+  "Chow-Chow",
+  "Post-weaning HFHS-HFHS",
+  "Post-weaning HFHS-Chow"
+)
+
+comparisons <- list(
+  c("Lactation HFHS-HFHS", "Lactation HFHS-Chow"),
+  c("Chow-HFHS", "Chow-Chow"),
+  c("Post-weaning HFHS-HFHS", "Post-weaning HFHS-Chow"),
+  c("Chow-HFHS", "Lactation HFHS-HFHS"),
+  c("Chow-HFHS", "Post-weaning HFHS-HFHS"),
+  c("Lactation HFHS-HFHS", "Post-weaning HFHS-HFHS")
+)
+
+pairwise_results <- expr_long_melt %>%
+  group_by(Gene) %>%
+  pairwise_t_test(formula = Expression ~ group,
+                  p.adjust.method = "BH",
+                  comparisons = comparisons) %>%
+  ungroup()
+
+# Show which comparisons were produced
+print("Computed comparisons:")
+
+# 1) build wide p.adj table from the pairwise t-test output
+pairwise_wide <- pairwise_results %>%
+  dplyr::select(Gene, group1, group2, p.adj) %>%
+  tidyr::unite("Comparison", group1, group2, sep = "_vs_") %>%
+  tidyr::pivot_wider(names_from = Comparison, values_from = p.adj, names_prefix = "p.adj_")
+
+# 2) compute group means on a log-like normalized matrix (use TMM log2-CPM or VST)
+#    here we use expr_tmm_log2cpm produced in normalize-expression
+group_means <- as.data.frame(expr_tmm_log2cpm) %>%
+  tibble::rownames_to_column("Gene") %>%
+  tidyr::pivot_longer(-Gene, names_to = "sample_name", values_to = "Expression") %>%
+  left_join(sample_info %>% dplyr::select(sample_name, group), by = "sample_name") %>%
+  dplyr::group_by(Gene, group) %>%
+  dplyr::summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+# 3) compute log2 fold-change = difference on the log2 scale
+logfc_list <- lapply(comparisons, function(comp) {
+  g1 <- comp[1]; g2 <- comp[2]
+  comp_df <- group_means %>%
+    dplyr::filter(group %in% c(g1, g2)) %>%
+    tidyr::pivot_wider(names_from = group, values_from = mean_expr) %>%
+    dplyr::mutate(log2FC = .data[[g1]] - .data[[g2]]) %>%
+    dplyr::select(Gene, log2FC) %>%
+    dplyr::mutate(Comparison = paste0(g1, "_vs_", g2))
+  comp_df
+})
+logfc_df <- dplyr::bind_rows(logfc_list)
+
+logfc_wide <- logfc_df %>%
+  tidyr::pivot_wider(names_from = Comparison, values_from = log2FC, names_prefix = "log2FC_")
+
+# 4) join log2FCs into pairwise_wide
+pairwise_wide <- pairwise_wide %>% dplyr::left_join(logfc_wide, by = "Gene")
+
+# save for inspection
+save_df_xlsx(pairwise_wide, file.path(out_dir, "tables", "pairwise_wide_ttest_with_log2FC.xlsx"))
+```
+
+
+```{r venn-and-save, fig.width=9, fig.height=7}
+
+# Here, p_adj < 0.05 and abs(log2_FC) > 0.378 (1.3x change)
+# call helper with explicit original group names (must match how you defined comparisons)
+sig_chow_genes <- get_genes_for_comp(pairwise_wide, "Chow-HFHS", "Chow-Chow", pth = 0.05, lfc_thr = 0.378)
+sig_pw_genes   <- get_genes_for_comp(pairwise_wide, "Post-weaning HFHS-HFHS", "Post-weaning HFHS-Chow", pth = 0.05, lfc_thr = 0.378)
+sig_lact_genes <- get_genes_for_comp(pairwise_wide, "Lactation HFHS-HFHS", "Lactation HFHS-Chow", pth = 0.05, lfc_thr = 0.378)
+
+genes_list <- list(
+  "Chow-HFHS vs Chow-Chow" = sig_chow_genes,
+  "Post-weaning HFHS-HFHS vs Post-weaning HFHS-Chow" = sig_pw_genes,
+  "Lactation HFHS-HFHS vs Lactation HFHS-Chow" = sig_lact_genes
+)
+
+adj_cols <- c(
+  "Control" = "p.adj_Chow-HFHS_vs_Chow-Chow",
+  "Post-weaning" = "p.adj_Post-weaning HFHS-HFHS_vs_Post-weaning HFHS-Chow",
+  "Lactation" = "p.adj_Lactation HFHS-HFHS_vs_Lactation HFHS-Chow"
+)
+
+venn_grob <- venn.diagram(
+  x = genes_list,
+  category.names = names(genes_list),
+  filename = NULL,
+  fill = c("#000000","#208696","#de5528"),
+  alpha = 0.6,
+  fontfamily = "Arial",
+  cat.fontfamily = "Arial",
+  main.fontfamily = "Arial",
+  cex = 1.2,      # size of numbers inside regions
+  cat.cex = 0,    # hide on-plot category labels
+  cat.col = c("#000000","#208696","#de5528")
+)
+
+grid.newpage()
+grid.draw(venn_grob)
+
+# Plot Venn and Legend separately
+png(filename = file.path(out_dir, "plots", "venn_only.png"),
+    width = 7, height = 6, units = "in", res = 300)
+grid.draw(venn_grob)
+dev.off()
+
+png(filename = file.path(out_dir, "plots", "venn_legend_only.png"),
+    width = 10, height = 2, units = "in", res = 300)
+grid.newpage()
+
+n <- length(names(genes_list))
+legend_x_box <- 0.12
+legend_y_start <- 0.7     
+legend_spacing <- 0.14     
+box_w <- 0.12
+box_h <- 0.06
+legend_fontsize <- 16
+cols <- c("#000000","#208696","#de5528")
+
+for (i in seq_len(n)) {
+  y <- unit(legend_y_start - (i-1) * legend_spacing, "npc")
+  grid.rect(x = unit(legend_x_box, "npc"), y = y,
+            width = unit(box_w, "npc"), height = unit(box_h, "npc"),
+            gp = gpar(fill = cols[i], col = NA))
+  grid.text(label = names(genes_list)[i],
+            x = unit(legend_x_box + 0.20, "npc"), y = y,
+            just = "left", gp = gpar(fontfamily = "Arial", fontsize = legend_fontsize))
+}
+dev.off()
+
+```
+
+```{r GO BP for unique DEG for each comparison}
+library(clusterProfiler)
+library(org.Mm.eg.db) 
+length(intersect(sig_chow_genes, sig_lact_genes))
+
+unique_chow <- setdiff(sig_chow_genes, union(sig_pw_genes, sig_lact_genes))
+unique_pw   <- setdiff(sig_pw_genes, union(sig_chow_genes, sig_lact_genes))
+unique_lact <- setdiff(sig_lact_genes, union(sig_chow_genes, sig_pw_genes))
+
+unique_lists <- list(
+  "Chow-specific" = unique_chow,
+  "Postweaning-specific" = unique_pw,
+  "Lactation-specific" = unique_lact
+)
+
+ego_ctrl <- enrichGO(gene        = unique_chow,
+                     OrgDb       = org.Mm.eg.db,
+                     keyType     = "SYMBOL",
+                     ont         = "BP",
+                     pAdjustMethod = "BH",
+                     qvalueCutoff  = 0.05,
+                     readable    = TRUE)
+
+ego_pw <- enrichGO(gene          = unique_pw,
+                   OrgDb         = org.Mm.eg.db,
+                   keyType       = "SYMBOL",
+                   ont           = "BP",
+                   pAdjustMethod = "BH",
+                   qvalueCutoff  = 0.05,
+                   readable      = TRUE)
+
+ego_lact <- enrichGO(gene        = unique_lact,
+                     OrgDb       = org.Mm.eg.db,
+                     keyType     = "SYMBOL",
+                     ont         = "BP",
+                     pAdjustMethod = "BH",
+                     qvalueCutoff  = 0.05,
+                     readable    = TRUE)
+
+
+group_colors <- c(
+  "Chow-HFHS vs Chow-Chow" = "#000000",      
+  "Post-weaning HFHS-HFHS vs Post-weaning HFHS-Chow" = "#208696", 
+  "Lactation HFHS-HFHS vs Lactation HFHS-Chow" = "#de5528"   
+)
+
+
+sig_ego_control <- subset(ego_ctrl@result, p.adjust < 0.05)
+sig_ego_lact <- subset(ego_lact@result, p.adjust < 0.05)
+sig_ego_pw <- subset(ego_pw@result, p.adjust < 0.05)
+all_ego <- rbind(ego_ctrl@result, ego_pw@result, ego_lact@result)
+sig_ego <- subset(all_ego, p.adjust < 0.05)
+
+ego_ctrl@result$Group <- "Chow-HFHS vs Chow-Chow"
+ego_pw@result$Group   <- "Post-weaning HFHS-HFHS vs Post-weaning HFHS-Chow"
+ego_lact@result$Group <- "Lactation HFHS-HFHS vs Lactation HFHS-Chow"
+
+all_ego <- rbind(
+  ego_ctrl@result,
+  ego_pw@result,
+  ego_lact@result
+)
+
+sig_ego <- subset(all_ego, p.adjust < 0.05)
+
+terms <- sig_ego %>%
+  group_by(Group) %>%
+  slice_min(p.adjust, n = 150) %>%  # pick top 150 per group
+  ungroup()
+
+
+terms$Description <- fct_reorder(terms$Description, -log10(terms$p.adjust))
+
+go_bp_3comp <- ggplot(terms, aes(x = Description, 
+                      y = -log10(p.adjust), 
+                      fill = Group)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = group_colors) +
+  coord_flip() +
+  labs(
+    y = expression(-log[10]("Adjusted P-value")),
+    x = NULL,
+    title = "GO Biological Process Enrichment (Unique DEGs per Comparison)"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    axis.text.y = element_text(size = 10, color = "black"),
+    axis.text.x = element_text(size = 10, color = "black"),
+    axis.title = element_text(size = 12, face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+go_bp_3comp
+ggsave(file.path(out_dir,"GO Biological Process Enrichment Unique DEG per Comparison.png"),go_bp_3comp, height =9, width = 12)
+```
+
+```{r}
+lipid_terms <- sig_ego[grep("lipid|fatty acid|cholesterol|triglyceride|lipoprotein", 
+                             sig_ego$Description, ignore.case = TRUE), ]
+
+lipid_storage_go <- ggplot(lipid_terms, aes(x = Description, 
+                      y = -log10(p.adjust), 
+                      fill = Group)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = group_colors) +
+  coord_flip() +
+  labs(
+    y = expression(-log[10]("Adjusted P-value")),
+    x = NULL,
+    title = "GO Biological Process Enrichment (Unique DEGs per Comparison)",
+    subtitle = "Lipid-storage Related Terms"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    axis.text.y = element_text(size = 10, color = "black"),
+    axis.text.x = element_text(size = 10, color = "black"),
+    axis.title = element_text(size = 12, face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+lipid_storage_go
+ggsave(file.path(out_dir,"GO Biological Process Enrichment Unique DEG per Comparison - Lipid Storage Related Terms.png"),lipid_storage_go, height =9, width = 11)
+```
+
+```{r Let's make Volcano Plots too}
+sig_chow_genes <- extract_sig_genes(
+  pairwise_wide,
+  "Chow-HFHS", "Chow-Chow",
+  p_thr = 0.05, lfc_thr = 0.378
+)
+
+chow_genes <- extract_sig_genes(
+  pairwise_wide,
+  "Chow-HFHS", "Chow-Chow",
+  p_thr = 1.0, lfc_thr = 0.0
+)
+
+sig_pw_genes <- extract_sig_genes(
+  pairwise_wide,
+  "Post-weaning HFHS-HFHS", "Post-weaning HFHS-Chow",
+  p_thr = 0.05, lfc_thr = 0.378
+)
+
+pw_genes <- extract_sig_genes(
+  pairwise_wide,
+  "Post-weaning HFHS-HFHS", "Post-weaning HFHS-Chow",
+  p_thr = 1.0, lfc_thr = 0.0
+)
+
+sig_lact_genes <- extract_sig_genes(
+  pairwise_wide,
+  "Lactation HFHS-HFHS", "Lactation HFHS-Chow",
+  p_thr = 0.05, lfc_thr = 0.378
+)
+
+lact_genes <- extract_sig_genes(
+  pairwise_wide,
+  "Lactation HFHS-HFHS", "Lactation HFHS-Chow",
+  p_thr = 1.0, lfc_thr = 0.0
+)
+
+genes_to_label_chow <- c("Cfd", "Adipoq", "Mest", "Lep")
+genes_to_label_pw <- c("Cfd", "Adipoq", "Mest", "Lep")
+genes_to_label_lact <- c("Cfd", "Adipoq", "Mest", "Lep")
+
+group_colors_chow <- c(
+  "Not Sig" = "grey70",
+  "Up" = "#E64B35FF",
+  "Down" = "#4DBBD5FF"
+)
+
+group_colors_lact <- c(
+  "Not Sig" = "grey70",
+  "Up" = "#E64B35FF",
+  "Down" = "#4DBBD5FF"
+)
+
+group_colors_pw <- c(
+  "Not Sig" = "grey70",
+  "Up" = "#E64B35FF",
+  "Down" = "#4DBBD5FF"
+)
+
+chow_volcano <- volcano_plot(chow_genes, 
+                             title = "Chow-HFHS vs Chow-Chow",
+                             gene_col = "Gene",
+                             label_genes = genes_to_label_chow,
+                             group_colors = group_colors_chow)
+
+pw_volcano <- volcano_plot(pw_genes,
+                           title = "Post-weaning HFHS-HFHS vs HFHS-Chow",
+                           gene_col = "Gene",
+                           label_genes = genes_to_label_pw,
+                           group_colors = group_colors_pw)
+
+lact_volcano <- volcano_plot(lact_genes,
+                             gene_col = "Gene",
+                             label_genes = genes_to_label_lact,
+                             title = "Lactation HFHS-HFHS vs HFHS-Chow",
+                             group_colors = group_colors_lact)
+
+ggsave(file.path(out_dir, "Chow_HFHSvsChow_Chow_Volcano_Plot.png"), plot = chow_volcano, height = 6, width = 7)
+ggsave(file.path(out_dir, "Pw_HFHS_HFHSvsHFHS_Chow_Volcano_Plot.png"), plot = pw_volcano, height = 6, width = 7)
+ggsave(file.path(out_dir, "Lact_HFHS_HFHSvsHFHS_Chow_Volcano_Plot.png"), plot  = lact_volcano, height = 6, width = 7)
+```
+
+
+```{r}
+tag_enzymes <- c("Dgat2", "Plpp3", "Agpat2", "Dgat1", 
+                 "Lpcat3", "Lpgat1")
+
+expr_subset <- expr_matrix[rownames(expr_matrix) %in% tag_enzymes, ]
+
+expr_long <- as.data.frame(t(expr_subset))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(expr_long,
+                   sample_info[, c("sample_name", "group")],
+                   by.x = "Sample", by.y = "sample_name")
+
+expr_long_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+
+expr_avg <- expr_long_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE),
+            .groups = "drop")
+
+group_order <- c(
+  "Chow-Chow", "Chow-HFHS",
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS"
+)
+
+expr_avg$group <- factor(expr_avg$group, levels = group_order)
+
+# ------------------------------------------
+# 5. Z-score scaling per gene
+# ------------------------------------------
+expr_scaled <- expr_avg %>%
+  group_by(Gene) %>%
+  mutate(scaled_expr = as.numeric(scale(mean_expr))) %>%
+  ungroup()
+
+
+p_scaled <- ggplot(expr_scaled,
+                   aes(x = group, y = scaled_expr,
+                       color = Gene, group = Gene)) +
+  geom_line(size = 2.0) +
+  geom_point(size = 5) +
+  scale_color_viridis_d(option = "plasma") +
+  theme_classic() +
+  labs(title = "TAG Synthesis Pathway Enzymes",
+       x = "Group",
+       y = "Scaled Expression (Z-score)") +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle =0, hjust = 0.5)
+  )
+
+p_scaled
+
+ggsave(file.path(out_dir,"TAG synthesis enzymes.png"), p_scaled,height = 6, width = 11)
+```
+
+```{r}
+sns_activation_markers <- c("Nr4a1", "Fos", "Jun", "Lipe", "Pnpla2")
+
+expr_subset <- expr_matrix[rownames(expr_matrix) %in% sns_activation_markers, ]
+
+expr_long <- as.data.frame(t(expr_subset))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(expr_long,
+                   sample_info[, c("sample_name", "group")],
+                   by.x = "Sample", by.y = "sample_name")
+
+expr_long_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+
+expr_avg <- expr_long_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE),
+            .groups = "drop")
+
+group_order <- c(
+  "Chow-Chow", "Chow-HFHS",
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS"
+)
+
+expr_avg$group <- factor(expr_avg$group, levels = group_order)
+
+# ------------------------------------------
+# 5. Z-score scaling per gene
+# ------------------------------------------
+expr_scaled <- expr_avg %>%
+  group_by(Gene) %>%
+  mutate(scaled_expr = as.numeric(scale(mean_expr))) %>%
+  ungroup()
+
+
+p_scaled <- ggplot(expr_scaled,
+                   aes(x = group, y = scaled_expr,
+                       color = Gene, group = Gene)) +
+  geom_line(size = 2.0) +
+  geom_point(size = 5) +
+  scale_color_viridis_d(option = "plasma") +
+  theme_classic() +
+  labs(title = "SNS Activation Markers",
+       x = "Group",
+       y = "Scaled Expression (Z-score)") +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle =0, hjust = 0.5)
+  )
+
+p_scaled
+
+ggsave(file.path(out_dir,"SNS Activation Markers.png"), p_scaled,height = 6, width = 11)
+```
+```{r}
+sns_desactivation_markers <- c("G0s2", "Srebf1", "Fasn", "Dgat2")
+
+expr_subset <- expr_matrix[rownames(expr_matrix) %in% sns_desactivation_markers, ]
+
+expr_long <- as.data.frame(t(expr_subset))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(expr_long,
+                   sample_info[, c("sample_name", "group")],
+                   by.x = "Sample", by.y = "sample_name")
+
+expr_long_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+
+expr_avg <- expr_long_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE),
+            .groups = "drop")
+
+group_order <- c(
+  "Chow-Chow", "Chow-HFHS",
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS"
+)
+
+expr_avg$group <- factor(expr_avg$group, levels = group_order)
+
+# ------------------------------------------
+# 5. Z-score scaling per gene
+# ------------------------------------------
+expr_scaled <- expr_avg %>%
+  group_by(Gene) %>%
+  mutate(scaled_expr = as.numeric(scale(mean_expr))) %>%
+  ungroup()
+
+
+p_scaled <- ggplot(expr_scaled,
+                   aes(x = group, y = scaled_expr,
+                       color = Gene, group = Gene)) +
+  geom_line(size = 2.0) +
+  geom_point(size = 5) +
+  scale_color_viridis_d(option = "plasma") +
+  theme_classic() +
+  labs(title = "SNS Desactivation Markers",
+       x = "Group",
+       y = "Scaled Expression (Z-score)") +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle =0, hjust = 0.5)
+  )
+
+p_scaled
+
+ggsave(file.path(out_dir,"SNS Desactivation Markers.png"), p_scaled,height = 6, width = 11)
+```
+```{r Stimulated Adipocyte Marker}
+sns_desactivation_markers <- c("Plin1", "G0s2", "Adrb3", "Mgll", "Hsl", "Pnpla2", "Fabp4", "Ppara")
+#"Fasn", "Acaca", "Pcyt1a", "Scd1", "Insig1", "Glut4", "Srebf1", 
+expr_subset <- expr_matrix[rownames(expr_matrix) %in% sns_desactivation_markers, ]
+
+expr_long <- as.data.frame(t(expr_subset))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(expr_long,
+                   sample_info[, c("sample_name", "group")],
+                   by.x = "Sample", by.y = "sample_name")
+
+expr_long_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+
+expr_avg <- expr_long_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE),
+            .groups = "drop")
+
+group_order <- c(
+  "Chow-Chow", "Chow-HFHS",
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS"
+)
+
+expr_avg$group <- factor(expr_avg$group, levels = group_order)
+
+# ------------------------------------------
+# 5. Z-score scaling per gene
+# ------------------------------------------
+expr_scaled <- expr_avg %>%
+  group_by(Gene) %>%
+  mutate(scaled_expr = as.numeric(scale(mean_expr))) %>%
+  ungroup()
+
+
+p_scaled <- ggplot(expr_scaled,
+                   aes(x = group, y = scaled_expr,
+                       color = Gene, group = Gene)) +
+  geom_line(size = 2.0) +
+  geom_point(size = 5) +
+  scale_color_viridis_d(option = "plasma") +
+  theme_classic() +
+  labs(title = "Stimulated by NE",
+       x = "Group",
+       y = "Scaled Expression (Z-score)") +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle =0, hjust = 0.5)
+  )
+
+p_scaled
+
+#ggsave(file.path(out_dir,"Stimulated Adipocyte Marker.png"), p_scaled,height = 6, width = 11)
+
+```
+```{r GO:0001659 Temperature Homeostasis}
+# GO term
+go_id <- "GO:0001659"
+
+# Name of the term (to display)
+go_label <- AnnotationDbi::select(GO.db, keys = go_id,
+                                  columns = "TERM",
+                                  keytype = "GOID")$TERM
+
+# Fetch genes annotated to GO term
+go2gene <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = go_id,
+  keytype = "GOALL",
+  columns = c("SYMBOL")
+)
+
+go_genes <- unique(go2gene$SYMBOL)
+
+# Subset expression matrix
+expr_sub <- expr_matrix[rownames(expr_matrix) %in% go_genes, ]
+
+# Filter genes by mean expression
+gene_means <- rowMeans(expr_sub, na.rm = TRUE)
+keep_genes <- names(gene_means[gene_means > 500])
+expr_filt <- expr_sub[keep_genes, ]
+
+# Add annotation term to each gene
+gene_annotation <- data.frame(
+  Gene = keep_genes,
+  Annotated_Term = go_label
+)
+rownames(gene_annotation) <- gene_annotation$Gene
+gene_annotation$Gene <- NULL
+
+# Prepare long-format DF
+expr_long <- as.data.frame(t(expr_filt))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(
+  expr_long,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+# Filter HFHS groups
+hfhs_groups <- c("Chow-HFHS", "Lactation HFHS-HFHS", "Post-weaning HFHS-HFHS")
+expr_long <- expr_long %>% filter(group %in% hfhs_groups)
+```
+```{r}
+parent_go <- "GO:0001659"   # parent GO term
+depth <- 3   
+
+descendant_terms <- get_descendants(parent_go, depth)
+if(length(descendant_terms) == 0) stop("No descendants found at this depth")
+
+go2gene <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = descendant_terms,
+  keytype = "GOALL",
+  columns = c("SYMBOL", "GOALL")
+)
+
+go2gene <- go2gene %>%
+  filter(!is.na(SYMBOL)) %>%
+  filter(SYMBOL %in% rownames(expr_filt))
+
+go_terms <- AnnotationDbi::select(
+  GO.db,
+  keys = descendant_terms,
+  columns = "TERM",
+  keytype = "GOID"
+)
+
+colnames(go_terms) <- c("GOALL", "GO_name")
+gene2go <- left_join(go2gene, go_terms, by = "GOALL") %>%
+  distinct(SYMBOL, GO_name)
+
+gene_go_map <- gene2go[!duplicated(gene2go$SYMBOL), ]
+rownames(gene_go_map) <- gene_go_map$SYMBOL
+gene_go_map$SYMBOL <- NULL
+
+row_annotation <- data.frame(GO_descendant = gene_go_map)
+rownames(row_annotation) <- rownames(gene_go_map)
+
+unique_terms <- unique(gene_go_map$GO_name)
+colors <- setNames(
+  colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(length(unique_terms)),
+  unique_terms
+)
+
+expr_long <- as.data.frame(t(expr_filt))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(
+  expr_long,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+expr_long <- expr_long %>% filter(group %in% hfhs_groups)
+
+
+expr_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+expr_avg <- expr_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_mat <- expr_avg %>%
+  tidyr::pivot_wider(names_from = group, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(expr_mat) <- expr_mat$Gene
+expr_mat$Gene <- NULL
+
+expr_scaled <- t(scale(t(expr_mat)))
+
+# Average expression per GO term
+expr_by_go <- expr_df %>%
+  group_by(GO_name) %>%
+  summarise(across(-Gene, mean, na.rm = TRUE)) %>%
+  as.data.frame()
+expr_by_go <- na.omit(expr_by_go)
+rownames(expr_by_go) <- expr_by_go$GO_name
+
+expr_by_go$GO_name <- NULL
+
+pheatamp_temperature_homeostasis_subclasses <- pheatmap(expr_scaled,
+                                                        cluster_rows = TRUE,
+                                                        cluster_cols = FALSE,
+                                                        show_rownames = TRUE,
+                                                        fontsize_row = 6,
+                                                        fontsize_col = 10,
+                                                        angle_col = 0,
+                                                        annotation_row = row_annotation,
+                                                        annotation_colors = list(GO_descendant = colors),
+                                                        main = paste0("GO descendants (depth=", depth, ") of ", parent_go)
+                                                          )
+
+ggsave(file.path(out_dir, "Heatmap_All_temperature_homeostasis_subclasses.png"), pheatamp_temperature_homeostasis_subclasses, height = 8, width = 11)
+```
+
+
+```{r IR correlated genes from paper}
+# Import IR Correlated Gene List
+
+IR_genes <- Supplementary_figure_IR_sensitivity %>%
+  mutate(`Z-score` = as.numeric(`Z-score`))
+
+IR_genes_pos_list <- IR_genes %>%
+  filter(`Z-score` > 0) %>%
+  pull(Symbol)
+
+IR_genes_neg_list <- IR_genes %>%
+  filter(`Z-score` < 0) %>%
+  pull(Symbol)
+
+all_IR_genes <- unique(c(IR_genes_pos_list, IR_genes_neg_list))
+
+# Subset expression matrix to IR-related genes
+
+expr_subset <- expr_matrix[
+  tolower(rownames(expr_matrix)) %in% tolower(all_IR_genes),
+]
+
+res_control <- run_DESeq_pair(
+  "Chow-Chow", "Chow-HFHS",
+  expr_subset, sample_info
+)
+
+res_lactation <- run_DESeq_pair(
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  expr_subset, sample_info
+)
+
+res_pw <- run_DESeq_pair(
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS",
+  expr_subset, sample_info
+)
+
+all_res <- bind_rows(res_control, res_lactation, res_pw)
+
+sig_genes_FC <- all_res %>%
+  filter(
+    padj < 0.05,                    
+    abs(log2FoldChange) > 0.378     
+  ) %>%
+  distinct(Gene)
+
+expr_sig <- expr_matrix[
+  rownames(expr_matrix) %in% sig_genes_FC$Gene,
+]
+
+expr_long <- t(expr_sig) %>% as.data.frame()
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(
+  expr_long,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+expr_long_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+expr_avg <- expr_long_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_mat <- expr_avg %>%
+  pivot_wider(names_from = group, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(expr_mat) <- expr_mat$Gene
+expr_mat$Gene <- NULL
+
+group_order <- c(
+  "Chow-Chow", "Chow-HFHS",
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS"
+)
+
+expr_mat <- expr_mat[, group_order]
+
+pheatmap_IR_all <- pheatmap(
+                            as.matrix(expr_mat),
+                            cluster_rows = TRUE,
+                            cluster_cols = FALSE,
+                            scale = "row",
+                            show_rownames = TRUE,
+                            fontsize_row = 8,
+                            main = "IR-related Gene Expression (Positive & Negative Correlation)"
+                          )
+ggsave(file.path(out_dir, "Heatmap_All_6Groups_Pos_Neg.png"), pheatmap_IR_all, height = 6, width = 7)
+```
+
+
+
+```{r}
+genes_pos_sig <- intersect(tolower(sig_genes_FC$Gene), tolower(IR_genes_pos_list))
+expr_pos <- expr_matrix[
+  tolower(rownames(expr_matrix)) %in% tolower(genes_pos_sig),
+]
+
+expr_long_pos <- t(expr_pos) %>% as.data.frame()
+expr_long_pos$Sample <- rownames(expr_long_pos)
+
+expr_long_pos <- merge(
+  expr_long_pos,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+expr_melt_pos <- melt(
+  expr_long_pos,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+hfhs_groups <- c(
+  "Chow-HFHS",
+  "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-HFHS"
+)
+
+expr_melt_pos_3groups <- expr_melt_pos %>%
+  filter(group %in% hfhs_groups)
+
+expr_avg_3groups <- expr_melt_pos_3groups %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_mat_3groups <- expr_avg_3groups %>%
+  pivot_wider(names_from = group, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(expr_mat_3groups) <- expr_mat_3groups$Gene
+expr_mat_3groups$Gene <- NULL
+
+expr_mat_3groups <- expr_mat_3groups[, hfhs_groups] 
+expr_mat_3groups <- expr_mat_3groups[apply(expr_mat_3groups, 1, function(x) all(is.finite(x))), ]
+expr_mat_3groups <- expr_mat_3groups[apply(expr_mat_3groups, 1, sd) != 0, ]
+
+expr_mat_3groups_filtered <- expr_mat_3groups[
+  apply(expr_mat_3groups, 1, function(x) mean(x, na.rm = TRUE) > 500),
+]
+
+pheatmap_IR_pos_HFHFS_second_hit <- pheatmap(
+  as.matrix(expr_mat_3groups_filtered),
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  fontsize_row = 8,
+  fontsize_col = 10,
+  angle_col = 0, 
+  main = "IR Positively Correlated Genes"
+)
+
+ggsave(file.path(out_dir, "Heatmap_HFHS_second_hit_IR_pos.png"), pheatmap_IR_pos_HFHFS_second_hit, height = 8, width = 12)
+```
+
+
+```{r Positive Inflammatory Response Genes}
+# Positive Regulation of Inflammatory Response
+go_id <- "GO:0050729"
+
+# Get Entrez IDs annotated to that GO term
+go2gene <- AnnotationDbi::select(org.Mm.eg.db,
+                                 keys = go_id,
+                                 keytype = "GOALL", 
+                                 columns = c("ENTREZID", "SYMBOL"))
+
+inflam_genes <- unique(go2gene$SYMBOL)
+
+# Subset expression matrix to these genes
+expr_sub <- expr_matrix[rownames(expr_matrix) %in% inflam_genes, ]
+
+# Filter out (mean < 500)
+
+gene_means <- rowMeans(expr_sub, na.rm = TRUE)
+keep_genes <- names(gene_means[gene_means > 500])
+expr_filt <- expr_sub[keep_genes, ]
+expr_long_inflam <- as.data.frame(t(expr_filt))
+expr_long_inflam$Sample <- rownames(expr_long_inflam)
+
+expr_long_inflam <- merge(
+  expr_long_inflam,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+expr_long_inflam <- expr_long_inflam %>% filter(group %in% hfhs_groups)
+
+expr_melt_inflam <- melt(
+  expr_long_inflam,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+expr_avg <- expr_melt_inflam %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_mat <- expr_avg %>%
+  pivot_wider(names_from = group, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(expr_mat) <- expr_mat$Gene
+expr_mat$Gene <- NULL
+
+expr_scaled <- t(scale(t(expr_mat)))
+pheatmap_Inflammatory_pos_HFHFS_second_hit <- pheatmap(expr_scaled,
+                                               cluster_rows = TRUE,
+                                               cluster_cols = FALSE,
+                                               show_rownames = TRUE,
+                                               fontsize_row = 7,
+                                               fontsize_col = 10,
+                                               angle_col = 0,  # ← THIS MAKES COLUMN NAMES HORIZONTAL
+                                               main = "Positive Inflammatory Response Genes (GO:0050729)")
+
+ggsave(file.path(out_dir, "Heatmap_HFHS_second_hit_Inflammatory_Response_pos.png"), pheatmap_Inflammatory_pos_HFHFS_second_hit, height = 8, width = 12)
+
+```
+
+
+```{r positive inflammatory genes all 6 groups}
+expr_long_inflam <- as.data.frame(t(expr_filt))
+expr_long_inflam$Sample <- rownames(expr_long_inflam)
+
+expr_long_inflam <- merge(
+  expr_long_inflam,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+expr_melt_inflam <- melt(
+  expr_long_inflam,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+expr_avg <- expr_melt_inflam %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_mat <- expr_avg %>%
+  pivot_wider(names_from = group, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(expr_mat) <- expr_mat$Gene
+expr_mat$Gene <- NULL
+
+expr_scaled <- t(scale(t(expr_mat)))
+pheatmap_Inflammatory_pos <- pheatmap(expr_scaled,
+                                               cluster_rows = TRUE,
+                                               cluster_cols = FALSE,
+                                               show_rownames = TRUE,
+                                               fontsize_row = 7,
+                                               fontsize_col = 10,
+                                               angle_col = 0,  # ← THIS MAKES COLUMN NAMES HORIZONTAL
+                                               main = "Positive Inflammatory Response Genes (GO:0050729)")
+
+ggsave(file.path(out_dir, "Heatmap_All_Inflammatory_Response_pos.png"), pheatmap_Inflammatory_pos, height = 8, width = 12)
+```
+
+
+```{r}
+go_id <- "GO:0050729"
+
+go_children <- as.list(GOBPCHILDREN)[[go_id]]  
+go_child_terms <- unique(go_children)          
+if (length(go_child_terms) == 0) stop("No direct GO children found for GO:0050729")
+
+go2gene <- AnnotationDbi::select(
+  org.Mm.eg.db,
+  keys = go_child_terms,
+  keytype = "GOALL",
+  columns = c("SYMBOL", "GOALL")
+)
+
+go2gene <- go2gene %>% 
+  filter(!is.na(SYMBOL)) %>%
+  filter(SYMBOL %in% rownames(expr_filt))
+
+go_terms <- AnnotationDbi::select(
+  GO.db,
+  keys = go_child_terms,
+  columns = "TERM",
+  keytype = "GOID"
+)
+
+colnames(go_terms) <- c("GOALL", "GO_name")
+
+gene2go <- left_join(go2gene, go_terms, by = "GOALL")
+
+gene2go <- gene2go %>% distinct(SYMBOL, GO_name)
+
+gene_go_map <- gene2go[!duplicated(gene2go$SYMBOL), ]
+
+rownames(gene_go_map) <- gene_go_map$SYMBOL
+gene_go_map$SYMBOL <- NULL
+
+row_annotation <- data.frame(GO_child = gene_go_map$GO_name)
+rownames(row_annotation) <- rownames(gene_go_map)
+
+go_children_unique <- unique(gene_go_map$GO_name)
+go_colors <- setNames(
+  colorRampPalette(brewer.pal(8, "Set2"))(length(go_children_unique)),
+  go_children_unique
+)
+
+expr_long <- as.data.frame(t(expr_filt))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(
+  expr_long,
+  sample_info[, c("sample_name", "group")],
+  by.x = "Sample", by.y = "sample_name"
+)
+
+expr_long <- expr_long %>% filter(group %in% hfhs_groups)
+
+expr_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+expr_avg <- expr_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_mat <- expr_avg %>%
+  tidyr::pivot_wider(names_from = group, values_from = mean_expr) %>%
+  as.data.frame()
+
+rownames(expr_mat) <- expr_mat$Gene
+expr_mat$Gene <- NULL
+
+expr_scaled <- t(scale(t(expr_mat)))
+
+row_annotation <- data.frame(GO_child = gene_go_map[rownames(expr_scaled), , drop = FALSE])
+rownames(row_annotation) <- rownames(expr_scaled)
+
+go_children_unique <- unique(gene_go_map$GO_name)
+go_colors <- setNames(
+  colorRampPalette(brewer.pal(8, "Set2"))(length(go_children_unique)),
+  go_children_unique
+)
+
+pheatamp_inflam_pos_subclasses <- pheatmap(
+                        expr_scaled,
+                        cluster_rows = TRUE,
+                        cluster_cols = FALSE,
+                        show_rownames = TRUE,
+                        fontsize_row = 6,
+                        fontsize_col = 10,
+                        angle_col = 0,
+                        annotation_row = row_annotation,
+                        annotation_colors = list(GO_child = go_colors),
+                        main = "Direct GO Children of GO:0050729"
+                        )
+ggsave(file.path(out_dir, "Heatmap_All_Inflammatory_Response_pos_subclasses.png"), pheatamp_inflam_pos_subclasses, height = 8, width = 13)
+
+print(rownames(expr_scaled))
+print(rownames(expr_mat_3groups_filtered))
+```
+
