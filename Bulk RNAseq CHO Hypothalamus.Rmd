@@ -175,11 +175,12 @@ go_bp_down <- enrichGO(
 )
 
 keywords <- c(
-  "leptin", "insulin", "energy", "feeding", "appetite",
-  "neuropeptide",
-  "JAK", "STAT", 
-  "reticulum", "stress", "unfolded", "protein",
-  "lipid", "inflammation"
+    "endoplasmic reticulum",
+    "unfolded",
+    "protein",
+    "misfolded",
+    "proteostasis",
+    "ER stress"
 )
 go_bp_up_df <- as.data.frame(go_bp_up)
 go_bp_down_df <- as.data.frame(go_bp_down)
@@ -209,53 +210,8 @@ go_down_plot <- go_bp_down_focus %>%
 col_up   <- "#C73E1D"   # muted red (stress)
 col_down <- "#2A7FFF"   # soft blue (metabolic down)
 
-p_up <- ggplot(go_up_plot, aes(x = Description, y = negLogP)) +
-  geom_col(fill = col_up, width = 0.7) +
-  coord_flip() +
-  labs(
-    title = "Upregulated Biological Processes",
-    subtitle = "Lactation HFHS vs Chow HFHS (Hypothalamus)",
-    x = NULL,
-    y = expression(-log[10]("adjusted p-value"))
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", size = 15),
-    plot.subtitle = element_text(size = 11, color = "grey40"),
-    axis.text.y = element_text(size = 11),
-    axis.text.x = element_text(size = 10),
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
-
-p_down <- ggplot(go_down_plot, aes(x = Description, y = negLogP)) +
-  geom_col(fill = col_down, width = 0.7) +
-  coord_flip() +
-  labs(
-    title = "Downregulated Biological Processes",
-    subtitle = "Lactation HFHS vs Chow HFHS (Hypothalamus)",
-    x = NULL,
-    y = expression(-log[10]("adjusted p-value"))
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", size = 15),
-    plot.subtitle = element_text(size = 11, color = "grey40"),
-    axis.text.y = element_text(size = 11),
-    axis.text.x = element_text(size = 10),
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank()
-  )
-
-p_up + p_down
-
-
-```
-
-
-```{r}
 go_up_plot$Direction   <- "Upregulated"
-go_down_plot$Direction <- "Downregulated"
+#go_down_plot$Direction <- "Downregulated"
 
 go_up_plot$plot_value   <-  go_up_plot$negLogP
 go_down_plot$plot_value <- -go_down_plot$negLogP
@@ -287,6 +243,204 @@ ggplot(go_combined,
     legend.position = "top"
   )
 ```
+
+```{r let's look at words that appear the most in the GO terms for go_bp_up_df and go_bp_down_df in terms of frequency}
+
+go_categories <- list(
+  "ER stress / unfolded protein" = c(
+    "endoplasmic reticulum",
+    "unfolded",
+    "protein",
+    "misfolded",
+    "proteostasis",
+    "ER stress"
+  ),
+  "Lipid metabolism" = c(
+    "lipid",
+    "fatty",
+    "cholesterol",
+    "catabolic",
+    "oxidation"
+  ),
+  "Hormone signaling" = c(
+    "leptin",
+    "insulin",
+    "neuropeptide"
+  )
+)
+
+go_plot_df <- go_up_classified %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 220) %>%
+  mutate(
+    highlight = ifelse(Category == "ER stress / unfolded protein",
+                       "ER stress",
+                       "Other GO terms"),
+    Description = factor(Description, levels = rev(Description))
+  )
+
+ggplot(go_plot_df,
+       aes(x = Description,
+           y = -log10(p.adjust),
+           fill = highlight)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "ER stress" = "#C73E1D",
+      "Other GO terms" = "grey80"
+    )
+  ) +
+  labs(
+    title = "ER Stress GO Terms Are Enriched Among the Top Upregulated Processes",
+    x = NULL,
+    y = expression(-log[10]("adjusted p-value")),
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold")
+  )
+
+
+ggplot(donut_df,
+       aes(x = reorder(Category, n),
+           y = n,
+           fill = Category)) +
+  geom_col(width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Distribution of Upregulated GO Terms by Functional Category",
+    subtitle = "Majority of GO terms are functionally diverse",
+    x = NULL,
+    y = "Number of GO terms"
+  ) +
+  scale_fill_manual(values = c(
+    "ER stress / unfolded protein" = "#C73E1D",
+    "Lipid metabolism" = "#2A7FFF",
+    "Hormone signaling" = "#6A4C93",
+    "Other biological processes" = "grey80"
+  )) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+```
+```{r most frequent words in the enriched GOs}
+custom_stopwords <- c(
+  "process", "regulation", "positive", "negative",
+  "cell", "cells", "cellular",
+  "response", "via", "dependent",
+  "activity", "mediated",
+  "signaling", "pathway", "development", "morphogenesis", "transport", "ion", "secretion", "differentiation", "transmembrane", "receptor"
+)
+go_up_words <- go_bp_up_df %>%
+  dplyr::select(Description) %>%
+  unnest_tokens(word, Description) %>%
+  filter(
+    !word %in% stop_words$word,
+    !word %in% custom_stopwords,
+    str_detect(word, "[a-z]")
+  ) %>%
+  dplyr::count(word, sort = TRUE)
+
+head(go_up_words, 20)
+
+go_down_words <- go_bp_down_df %>%
+  dplyr::select(Description) %>%
+  unnest_tokens(word, Description) %>%
+  filter(
+    !word %in% stop_words$word,
+    !word %in% custom_stopwords,
+    str_detect(word, "[a-z]")
+  ) %>%
+  dplyr::count(word, sort = TRUE)
+
+head(go_down_words, 20)
+
+go_up_words %>%
+  slice_max(n, n = 15) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "#C73E1D", width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Most Frequent Words in UP-regulated GO Terms",
+    x = NULL,
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.major.y = element_blank())
+
+go_down_words %>%
+  slice_max(n, n = 15) %>%
+  ggplot(aes(x = reorder(word, n), y = n)) +
+  geom_col(fill = "#2A7FFF", width = 0.7) +
+  coord_flip() +
+  labs(
+    title = "Most Frequent Words in DOWN-regulated GO Terms",
+    x = NULL,
+    y = "Frequency"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.major.y = element_blank())
+
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(tidytext)
+library(stringr)
+library(ggalluvial)
+
+top_words_up <- go_up_words %>%
+  slice_max(n, n = 5) %>%
+  pull(word)
+
+# Ensure Description is character
+go_bp_up_df <- go_bp_up_df %>%
+  mutate(Description = as.character(Description))
+
+# Initialize a vector to store the assigned word
+assigned_word <- character(nrow(go_bp_up_df))
+
+for(i in seq_len(nrow(go_bp_up_df))) {
+  desc <- tolower(go_bp_up_df$Description[i])
+  matches <- top_words_up[str_detect(desc, fixed(top_words_up))]
+  assigned_word[i] <- if(length(matches) > 0) matches[1] else NA_character_
+}
+
+# Add to dataframe and filter only matched GO terms
+word_to_go_up_simple <- go_bp_up_df %>%
+  mutate(word = assigned_word) %>%
+  filter(!is.na(word)) %>%
+  dplyr::select(word, Description) %>%
+  distinct()
+
+
+ggplot(word_to_go_up_simple,
+       aes(axis1 = word,
+           axis2 = Description,
+           y = 1)) +
+  geom_alluvium(aes(fill = word), width = 0.25, alpha = 0.8) +
+  geom_stratum(width = 0.25, fill = "grey80", color = "black") +
+  geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+  scale_x_discrete(limits = c("Word", "GO term")) +
+  labs(
+    title = "Top 5 GO words → GO term descriptions (Upregulated)",
+    y = "Count / Flow"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+```
+
+
+
+
 
 ```{r GO BP DEG}
 deg_symbols <- rownames(sig_genes)
