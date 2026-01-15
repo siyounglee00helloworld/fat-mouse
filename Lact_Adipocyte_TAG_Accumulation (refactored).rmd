@@ -156,7 +156,6 @@ save_df_xlsx(pairwise_wide, file.path(out_dir, "tables", "pairwise_wide_ttest_wi
 ```{r venn-and-save, fig.width=9, fig.height=7}
 
 # Here, p_adj < 0.05 and abs(log2_FC) > 0.378 (1.3x change)
-# call helper with explicit original group names (must match how you defined comparisons)
 sig_chow_genes <- get_genes_for_comp(pairwise_wide, "Chow-HFHS", "Chow-Chow", pth = 0.05, lfc_thr = 0.378)
 sig_pw_genes   <- get_genes_for_comp(pairwise_wide, "Post-weaning HFHS-HFHS", "Post-weaning HFHS-Chow", pth = 0.05, lfc_thr = 0.378)
 sig_lact_genes <- get_genes_for_comp(pairwise_wide, "Lactation HFHS-HFHS", "Lactation HFHS-Chow", pth = 0.05, lfc_thr = 0.378)
@@ -354,6 +353,38 @@ lipid_storage_go <- ggplot(lipid_terms, aes(x = Description,
   )
 lipid_storage_go
 ggsave(file.path(out_dir,"GO Biological Process Enrichment Unique DEG per Comparison - Lipid Storage Related Terms.png"),lipid_storage_go, height =9, width = 11)
+```
+```{r}
+neuronal_regulation_terms <- sig_ego[grep("synap|neuro", 
+                             sig_ego$Description, ignore.case = TRUE), ]
+
+neuronal_regulation_go <- ggplot(neuronal_regulation_terms, aes(x = Description, 
+                      y = -log10(p.adjust), 
+                      fill = Group)) +
+  geom_bar(stat = "identity", width = 0.7, color = "black", linewidth = 0.2) +
+  scale_fill_manual(values = group_colors) +
+  coord_flip() +
+  labs(
+    y = expression(-log[10]("Adjusted P-value")),
+    x = NULL,
+    title = "GO Biological Process Enrichment (Unique DEGs per Comparison)",
+    subtitle = "Neuronal Regulation Related Terms"
+  ) +
+  theme_minimal(base_family = "Arial") +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    axis.text.y = element_text(size = 10, color = "black"),
+    axis.text.x = element_text(size = 10, color = "black"),
+    axis.title = element_text(size = 12, face = "bold"),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    plot.margin = margin(10, 10, 10, 10)
+  )
+neuronal_regulation_go
+ggsave(file.path(out_dir,"GO Biological Process Enrichment Unique DEG per Comparison - Neuronal Regulation Related Terms.png"),neuronal_regulation_go, height =9, width = 11)
 ```
 
 ```{r Let's make Volcano Plots too}

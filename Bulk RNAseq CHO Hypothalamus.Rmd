@@ -133,7 +133,7 @@ deg_down_lact <- res_df_lact_chow %>%
 deg_up_lact
 ```
 
-```{r lets compare up vs down}
+```{r lets compare up vs down 15% of the GO terms are related to protein folding, ER stress}
 # UP genes
 up_symbols <- rownames(deg_up_lact)
 up_entrez <- bitr(
@@ -250,6 +250,42 @@ p_down <- ggplot(go_down_plot, aes(x = Description, y = negLogP)) +
 p_up + p_down
 
 
+```
+
+
+```{r}
+go_up_plot$Direction   <- "Upregulated"
+go_down_plot$Direction <- "Downregulated"
+
+go_up_plot$plot_value   <-  go_up_plot$negLogP
+go_down_plot$plot_value <- -go_down_plot$negLogP
+
+go_combined <- bind_rows(go_up_plot, go_down_plot)
+
+ggplot(go_combined,
+       aes(x = Description, y = plot_value, fill = Direction)) +
+  geom_col(width = 0.75) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c("Upregulated" = col_up,
+               "Downregulated" = col_down)
+  ) +
+  geom_hline(yintercept = 0, color = "grey30", linewidth = 0.6) +
+  labs(
+    title = "Directional GO Enrichment in Hypothalamus",
+    subtitle = "Lactation HFHS vs Chow HFHS",
+    x = NULL,
+    y = expression(-log[10]("adjusted p-value"))
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16),
+    plot.subtitle = element_text(size = 11, color = "grey40"),
+    axis.text.y = element_text(size = 11),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "top"
+  )
 ```
 
 ```{r GO BP DEG}
