@@ -185,6 +185,49 @@ keywords <- c(
 go_bp_up_df <- as.data.frame(go_bp_up)
 go_bp_down_df <- as.data.frame(go_bp_down)
 
+top10_up <- go_bp_up_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Upregulated")
+
+top10_down <- go_bp_down_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Downregulated")
+
+go_top10_combined <- bind_rows(top10_up, top10_down)
+
+top10_GO<- ggplot(go_top10_combined,
+             aes(x = reorder(Description, -log10(p.adjust)),
+                 y = -log10(p.adjust),
+                 fill = direction)) +
+        geom_col(width = 0.7) +
+        coord_flip() +
+        facet_wrap(~ direction, scales = "free_y") +
+        scale_fill_manual(values = c(
+          "Upregulated"   = "#C73E1D",
+          "Downregulated" = "#2A7FFF"
+        )) +
+        labs(
+          title = "Top 10 GO BP Terms in Up- and Downregulated Genes",
+          x = NULL,
+          y = expression(-log[10]("adjusted p-value")),
+          fill = NULL
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5)
+        )
+
+ggsave(
+  filename = "GO_enrichment_up_down.png",
+  plot = top10_GO,
+  width = 16,
+  height = 8,
+  dpi = 300
+)
+
 go_bp_up_focus <- go_bp_up_df %>%
   filter(grepl(paste(keywords, collapse = "|"),
                Description, ignore.case = TRUE))
@@ -206,7 +249,7 @@ go_down_plot <- go_bp_down_focus %>%
     Description = factor(Description, levels = rev(Description)),
     negLogP = -log10(p.adjust)
   )
-
+go_up_plot
 col_up   <- "#C73E1D"   # muted red (stress)
 col_down <- "#2A7FFF"   # soft blue (metabolic down)
 
@@ -218,30 +261,131 @@ go_down_plot$plot_value <- -go_down_plot$negLogP
 
 go_combined <- bind_rows(go_up_plot, go_down_plot)
 
-ggplot(go_combined,
-       aes(x = Description, y = plot_value, fill = Direction)) +
-  geom_col(width = 0.75) +
+ER_go <- ggplot(go_combined,
+           aes(x = Description, y = plot_value, fill = Direction)) +
+      geom_col(width = 0.75) +
+      coord_flip() +
+      scale_fill_manual(
+        values = c("Upregulated" = col_up,
+                   "Downregulated" = col_down)
+      ) +
+      geom_hline(yintercept = 0, color = "grey30", linewidth = 0.6) +
+      labs(
+        title = "Directional GO Enrichment in Hypothalamus",
+        subtitle = "Lactation HFHS vs Chow HFHS",
+        x = NULL,
+        y = expression(-log[10]("adjusted p-value"))
+      ) +
+      theme_minimal(base_size = 14) +
+      theme(
+        plot.title = element_text(face = "bold", size = 16),
+        plot.subtitle = element_text(size = 11, color = "grey40"),
+        axis.text.y = element_text(size = 11),
+        panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position = "top"
+      )
+
+ggsave(
+  filename = "ER_stress_GO_enrichment_only.png",
+  plot = ER_go,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r genes driving GO}
+library(tidyr)
+library(dplyr)
+
+go_genes_up <- go_bp_up_focus %>%
+  dplyr::select(ID, Description, geneID, p.adjust) %>%
+  mutate(
+    geneID = strsplit(as.character(geneID), "/"),
+    Direction = "Upregulated"
+  ) %>%
+  unnest(geneID)
+
+go_genes_down <- go_bp_down_focus %>%
+  dplyr::select(ID, Description, geneID, p.adjust) %>%
+  mutate(
+    geneID = strsplit(as.character(geneID), "/"),
+    Direction = "Downregulated"
+  ) %>%
+  unnest(geneID)
+
+go_genes_long <- bind_rows(go_genes_up, go_genes_down)
+str(go_genes_long$geneID)
+
+core_genes <- go_genes_long %>%
+  dplyr::count(Direction, geneID, sort = TRUE)
+
+head(core_genes, 15)
+
+ggplot(core_genes %>% filter(n >= 2),
+       aes(x = reorder(geneID, n), y = n, fill = Direction)) +
+  geom_col() +
   coord_flip() +
-  scale_fill_manual(
-    values = c("Upregulated" = col_up,
-               "Downregulated" = col_down)
-  ) +
-  geom_hline(yintercept = 0, color = "grey30", linewidth = 0.6) +
+  scale_fill_manual(values = c(
+    "Upregulated" = col_up,
+    "Downregulated" = col_down
+  )) +
   labs(
-    title = "Directional GO Enrichment in Hypothalamus",
-    subtitle = "Lactation HFHS vs Chow HFHS",
-    x = NULL,
-    y = expression(-log[10]("adjusted p-value"))
+    title = "Core Genes Driving Enriched GO Terms",
+    x = "Gene",
+    y = "Number of GO Terms"
   ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    plot.title = element_text(face = "bold", size = 16),
-    plot.subtitle = element_text(size = 11, color = "grey40"),
-    axis.text.y = element_text(size = 11),
-    panel.grid.major.y = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position = "top"
+  theme_minimal(base_size = 14)
+
+go_order <- go_genes_long %>%
+  distinct(Description, p.adjust) %>%
+  arrange(p.adjust) %>%
+  pull(Description)
+
+gene_order <- go_genes_long %>%
+  dplyr::count(geneID) %>%
+  arrange(desc(n)) %>%
+  pull(geneID)
+
+top_genes <- gene_order[1:25]
+
+go_genes_pub <- go_genes_long %>%
+  filter(geneID %in% top_genes) %>%
+  mutate(
+    Description = factor(Description, levels = rev(go_order)),
+    geneID = factor(geneID, levels = top_genes)
   )
+
+go_genes_heat_up<- ggplot(go_genes_pub,
+                       aes(x = geneID, y = Description)) +
+                  geom_tile(fill = "#C73E1D", color = "white", linewidth = 0.3) +
+                  labs(
+                    title = "Upregulated Genes Driving ER-Stress–Related GO Biological Processes",
+                    subtitle = "Hypothalamus: Lactation HFHS vs Chow HFHS",
+                    x = "Gene",
+                    y = "GO Biological Process"
+                  ) +
+                  theme_minimal(base_size = 13) +
+                  theme(
+                    axis.text.x = element_text(
+                      angle = 45,
+                      hjust = 1,
+                      vjust = 1,
+                      size = 9
+                    ),
+                    axis.text.y = element_text(size = 9),
+                    panel.grid = element_blank(),
+                    plot.title = element_text(face = "bold", size = 15),
+                    plot.subtitle = element_text(size = 11, color = "grey40")
+                  )
+ggsave(
+  filename = "ER_stress_GO_genes_up.png",
+  plot = go_genes_heat_up,
+  width = 16,
+  height = 8,
+  dpi = 300
+)
 ```
 
 ```{r let's look at words that appear the most in the GO terms for go_bp_up_df and go_bp_down_df in terms of frequency}
@@ -279,30 +423,37 @@ go_plot_df <- go_up_classified %>%
     Description = factor(Description, levels = rev(Description))
   )
 
-ggplot(go_plot_df,
-       aes(x = Description,
-           y = -log10(p.adjust),
-           fill = highlight)) +
-  geom_col(width = 0.7) +
-  coord_flip() +
-  scale_fill_manual(
-    values = c(
-      "ER stress" = "#C73E1D",
-      "Other GO terms" = "grey80"
-    )
-  ) +
-  labs(
-    title = "ER Stress GO Terms Are Enriched Among the Top Upregulated Processes",
-    x = NULL,
-    y = expression(-log[10]("adjusted p-value")),
-    fill = NULL
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(
-    panel.grid.major.y = element_blank(),
-    plot.title = element_text(face = "bold")
-  )
+p <- ggplot(go_plot_df,
+               aes(x = Description,
+                   y = -log10(p.adjust),
+                   fill = highlight)) +
+          geom_col(width = 0.7) +
+          coord_flip() +
+          scale_fill_manual(
+            values = c(
+              "ER stress" = "#C73E1D",
+              "Other GO terms" = "grey80"
+            )
+          ) +
+          labs(
+            title = "ER Stress GO Terms Are Enriched Among the Top Upregulated Processes",
+            x = NULL,
+            y = expression(-log[10]("adjusted p-value")),
+            fill = NULL
+          ) +
+          theme_minimal(base_size = 14) +
+          theme(
+            panel.grid.major.y = element_blank(),
+            plot.title = element_text(face = "bold")
+          )
 
+ggsave(
+  filename = "ER_stress_GO_enrichment.png",
+  plot = p,
+  width = 16,
+  height = 8,
+  dpi = 300
+)
 
 ggplot(donut_df,
        aes(x = reorder(Category, n),
@@ -326,6 +477,7 @@ ggplot(donut_df,
   theme(legend.position = "none")
 
 ```
+
 ```{r most frequent words in the enriched GOs}
 custom_stopwords <- c(
   "process", "regulation", "positive", "negative",
@@ -358,32 +510,46 @@ go_down_words <- go_bp_down_df %>%
 
 head(go_down_words, 20)
 
-go_up_words %>%
-  slice_max(n, n = 15) %>%
-  ggplot(aes(x = reorder(word, n), y = n)) +
-  geom_col(fill = "#C73E1D", width = 0.7) +
-  coord_flip() +
-  labs(
-    title = "Most Frequent Words in UP-regulated GO Terms",
-    x = NULL,
-    y = "Frequency"
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(panel.grid.major.y = element_blank())
+word_GO_bp_up <- go_up_words %>%
+                  slice_max(n, n = 15) %>%
+                  ggplot(aes(x = reorder(word, n), y = n)) +
+                  geom_col(fill = "#C73E1D", width = 0.7) +
+                  coord_flip() +
+                  labs(
+                    title = "Most Frequent Words in Upregulated GO Terms",
+                    x = NULL,
+                    y = "Frequency"
+                  ) +
+                  theme_minimal(base_size = 14) +
+                  theme(panel.grid.major.y = element_blank())
 
-go_down_words %>%
-  slice_max(n, n = 15) %>%
-  ggplot(aes(x = reorder(word, n), y = n)) +
-  geom_col(fill = "#2A7FFF", width = 0.7) +
-  coord_flip() +
-  labs(
-    title = "Most Frequent Words in DOWN-regulated GO Terms",
-    x = NULL,
-    y = "Frequency"
-  ) +
-  theme_minimal(base_size = 14) +
-  theme(panel.grid.major.y = element_blank())
+word_GO_bp_down <- go_down_words %>%
+                    slice_max(n, n = 15) %>%
+                    ggplot(aes(x = reorder(word, n), y = n)) +
+                    geom_col(fill = "#2A7FFF", width = 0.7) +
+                    coord_flip() +
+                    labs(
+                      title = "Most Frequent Words in Downregulated GO Terms",
+                      x = NULL,
+                      y = "Frequency"
+                    ) +
+                    theme_minimal(base_size = 14) +
+                    theme(panel.grid.major.y = element_blank())
+ggsave(
+  filename = "ER_stress_GO_enrichmentBP_word_up.png",
+  plot = word_GO_bp_up,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
 
+ggsave(
+  filename = "ER_stress_GO_enrichmentBP_word_down.png",
+  plot = word_GO_bp_down,
+  width = 12,
+  height = 8,
+  dpi = 300
+)
 ```
 
 ```{r}
@@ -442,83 +608,6 @@ ggplot(word_to_go_up_simple,
 
 
 
-```{r GO BP DEG}
-deg_symbols <- rownames(sig_genes)
-
-deg_entrez <- bitr(
-  deg_symbols,
-  fromType = "SYMBOL",
-  toType = "ENTREZID",
-  OrgDb = org.Mm.eg.db
-)$ENTREZID
-
-go_bp <- enrichGO(
-  gene          = deg_entrez,
-  OrgDb         = org.Mm.eg.db,
-  keyType       = "ENTREZID",
-  ont           = "BP",
-  pAdjustMethod = "BH",
-  pvalueCutoff  = 0.05,
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-go_cc <- enrichGO(
-  gene          = deg_entrez,
-  OrgDb         = org.Mm.eg.db,
-  keyType       = "ENTREZID",
-  ont           = "CC",
-  pAdjustMethod = "BH",
-  pvalueCutoff  = 0.05,
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-go_mf<- enrichGO(
-  gene          = deg_entrez,
-  OrgDb         = org.Mm.eg.db,
-  keyType       = "ENTREZID",
-  ont           = "MF",
-  pAdjustMethod = "BH",
-  pvalueCutoff  = 0.05,
-  qvalueCutoff  = 0.05,
-  readable      = TRUE
-)
-
-p_bp <- dotplot(go_bp, showCategory = 20) +
-  ggtitle("GO Biological Processes (DEGs)")
-
-p_cc <- dotplot(go_cc, showCategory = 20) +
-  ggtitle("GO Cellular Component (DEGs)")
-
-p_mf <- dotplot(go_mf, showCategory = 20) +
-  ggtitle("GO Molecular Function (DEGs)")
-p_bp
-ggsave(
-  filename = file.path(out_dir, "GO_BP_dotplot.png"),
-  plot = p_bp,
-  width = 6,
-  height = 8,
-  dpi = 300
-)
-
-ggsave(
-  filename = file.path(out_dir, "GO_CC_dotplot.png"),
-  plot = p_cc,
-  width = 6,
-  height = 8,
-  dpi = 300
-)
-
-ggsave(
-  filename = file.path(out_dir, "GO_MF_dotplot.png"),
-  plot = p_mf,
-  width = 6,
-  height = 8,
-  dpi = 300
-)
-
-```
 
 
 ```{r}
@@ -967,11 +1056,10 @@ write.csv(
 ```
 
 ```{r leptin signaling pathway}
-# Get KEGG gene IDs (ENTREZ IDs) for mouse leptin signaling pathway
-kegg_leptin <- keggGet("mmu04920")[[1]]$GENE
+go_leptin <- keggGet("GO:0044321")[[1]]$GENE
 
 # Extract Entrez IDs only (even indices)
-entrez_ids <- kegg_leptin[seq(1, length(kegg_leptin), 2)]
+entrez_ids <- go_leptin[seq(1, length(kegg_leptin), 2)]
 
 # Map Entrez IDs to gene symbols
 leptin_genes <- bitr(
@@ -1020,12 +1108,156 @@ pheatmap(
   cluster_rows = TRUE,
   cluster_cols = FALSE,  # already averaged by group
   annotation_col = annotation_col,
-  annotation_colors = ann_colors,
+  #annotation_colors = ann_colors,
   fontsize_row = 9,
   main = "Leptin Signaling Genes – Mean Expression per Group"
 )
 
 dev.off()
+```
+
+```{r negative regulation of insulin receptor signaling}
+
+go_leptin <- as.list(org.Hs.egGO2ALLEGS[["GO:0046627"]])  # ENTREZ IDs
+go_leptin <- unlist(go_leptin)
+
+# Map Entrez IDs to gene symbols
+leptin_genes <- bitr(
+  go_leptin,
+  fromType = "ENTREZID",
+  toType   = "SYMBOL",
+  OrgDb    = org.Hs.eg.db
+)$SYMBOL
+
+# --- 2. VST-normalized expression ---
+vsd <- vst(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+
+# Make uppercase copies for matching
+vsd_genes_upper <- toupper(rownames(vsd_mat))
+leptin_genes_upper <- toupper(leptin_genes)
+
+# Subset using case-insensitive match
+leptin_expr <- vsd_mat[vsd_genes_upper %in% leptin_genes_upper, ]
+
+# Keep original gene symbols
+expr_df <- as.data.frame(leptin_expr)
+expr_df$Gene <- rownames(expr_df)
+
+# --- 3. Convert to long format and join sample info ---
+expr_long <- expr_df %>%
+  pivot_longer(-Gene, names_to = "Sample", values_to = "Expression") %>%
+  left_join(sample_info_hypo[, c("sample_name", "group")],
+            by = c("Sample" = "sample_name"))
+
+# --- 4. Average by group ---
+expr_avg <- expr_long %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_matrix <- expr_avg %>%
+  pivot_wider(names_from = group, values_from = mean_expr) %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+# --- 5. Scale rows (genes) for heatmap ---
+expr_scaled <- t(scale(t(expr_matrix)))  # scale by row
+
+# --- 6. Column annotation ---
+annotation_col <- data.frame(Group = colnames(expr_scaled))
+rownames(annotation_col) <- colnames(expr_scaled)
+ann_colors <- list(Group = group_colors)  # define group_colors for your groups
+
+# --- 7. Plot heatmap ---
+pdf(file.path(out_dir, "negative regulation of insulin receptor signaling heatmap.pdf"), width = 8, height = 9)
+
+pheatmap(
+  expr_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,  # already averaged per group
+  annotation_colors = ann_colors,
+  fontsize_row = 9,
+  fontsize_col = 10,
+  main = "negative regulation of insulin receptor signaling",
+  angle_col = 45,       # rotate x-axis labels
+  border_color = "grey60",
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(50)
+)
+
+dev.off()
+
+```
+
+```{r positive regulation of insulin receptor signaling}
+
+go_leptin <- as.list(org.Hs.egGO2ALLEGS[["GO:0046628"]])  # ENTREZ IDs
+go_leptin <- unlist(go_leptin)
+
+# Map Entrez IDs to gene symbols
+leptin_genes <- bitr(
+  go_leptin,
+  fromType = "ENTREZID",
+  toType   = "SYMBOL",
+  OrgDb    = org.Hs.eg.db
+)$SYMBOL
+
+# --- 2. VST-normalized expression ---
+vsd <- vst(dds, blind = TRUE)
+vsd_mat <- assay(vsd)
+
+# Make uppercase copies for matching
+vsd_genes_upper <- toupper(rownames(vsd_mat))
+leptin_genes_upper <- toupper(leptin_genes)
+
+# Subset using case-insensitive match
+leptin_expr <- vsd_mat[vsd_genes_upper %in% leptin_genes_upper, ]
+
+# Keep original gene symbols
+expr_df <- as.data.frame(leptin_expr)
+expr_df$Gene <- rownames(expr_df)
+
+# --- 3. Convert to long format and join sample info ---
+expr_long <- expr_df %>%
+  pivot_longer(-Gene, names_to = "Sample", values_to = "Expression") %>%
+  left_join(sample_info_hypo[, c("sample_name", "group")],
+            by = c("Sample" = "sample_name"))
+
+# --- 4. Average by group ---
+expr_avg <- expr_long %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop")
+
+expr_matrix <- expr_avg %>%
+  pivot_wider(names_from = group, values_from = mean_expr) %>%
+  column_to_rownames("Gene") %>%
+  as.matrix()
+
+# --- 5. Scale rows (genes) for heatmap ---
+expr_scaled <- t(scale(t(expr_matrix)))  # scale by row
+
+# --- 6. Column annotation ---
+annotation_col <- data.frame(Group = colnames(expr_scaled))
+rownames(annotation_col) <- colnames(expr_scaled)
+ann_colors <- list(Group = group_colors)  # define group_colors for your groups
+
+# --- 7. Plot heatmap ---
+pdf(file.path(out_dir, "positive regulation of insulin receptor signaling heatmap.pdf"), width = 8, height = 9)
+
+pheatmap(
+  expr_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,  # already averaged per group
+  annotation_colors = ann_colors,
+  fontsize_row = 9,
+  fontsize_col = 10,
+  main = "positive regulation of insulin receptor signaling",
+  angle_col = 45,       # rotate x-axis labels
+  border_color = "grey60",
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(50)
+)
+
+dev.off()
+
 ```
 
 ```{r gene of interest}

@@ -15,7 +15,9 @@ library(viridis)
 source("R/utils.R")
 
 out_dir <- "output"
+out_dir_basic_df <- "processed_data_WAT"
 dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(out_dir_basic_df, recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(out_dir, "tables"), recursive = TRUE, showWarnings = FALSE)
 dir.create(file.path(out_dir, "plots"), recursive = TRUE, showWarnings = FALSE)
 
@@ -46,6 +48,9 @@ fill_map <- group_aes$fill
 color_map <- group_aes$color
 
 group_order <- c("Chow-Chow","Chow-HFHS","Lactation HFHS-Chow","Lactation HFHS-HFHS","Post-weaning HFHS-Chow","Post-weaning HFHS-HFHS")
+expr_matrix <- t(expr_matrix_t)
+expr_matrix <- as.data.frame(expr_matrix)
+write_xlsx(expr_matrix, file.path(out_dir_basic_df,"expression_matrix_WAT.xslx"))
 ```
 
 
@@ -384,7 +389,38 @@ neuronal_regulation_go <- ggplot(neuronal_regulation_terms, aes(x = Description,
     plot.margin = margin(10, 10, 10, 10)
   )
 neuronal_regulation_go
-ggsave(file.path(out_dir,"GO Biological Process Enrichment Unique DEG per Comparison - Neuronal Regulation Related Terms.png"),neuronal_regulation_go, height =9, width = 11)
+ggsave(file.path(out_dir,"GO Biological Process Enrichment Unique DEG per Comparison - Neuronal Regulation Related Terms.png"),neuronal_regulation_go, height =9, width = 13)
+```
+```{r}
+# Filter neuronal GO terms
+neuronal_terms <- sig_ego %>%
+  filter(grepl("synap|neuro", Description, ignore.case = TRUE))
+
+# Split genes into a list
+gene_list <- strsplit(neuronal_terms$geneID, split = "/")
+
+# Get all unique genes
+all_genes <- unique(unlist(gene_list))
+
+# Create binary matrix: GO terms (rows) x genes (columns)
+go_gene_matrix <- t(sapply(gene_list, function(x) all_genes %in% x))
+rownames(go_gene_matrix) <- neuronal_terms$Description
+colnames(go_gene_matrix) <- all_genes
+
+# Convert logical to numeric
+go_gene_matrix <- 1 * go_gene_matrix
+
+gene_counts_go <- colSums(go_gene_matrix)
+top_genes <- names(sort(gene_counts_go, decreasing = TRUE)[1:40])
+
+pheat_go<- pheatmap(go_gene_matrix[, top_genes],
+                   cluster_rows = TRUE,
+                   cluster_cols = TRUE,
+                   color = c("white", "steelblue"),
+                   fontsize_row = 9,
+                   fontsize_col = 9,
+                   angle_col = 45)
+ggsave(file.path(out_dir,"GO_WAT_BP_genes.png"),pheat_go, height =9, width = 13)
 ```
 
 ```{r Let's make Volcano Plots too}
@@ -531,6 +567,70 @@ p_scaled <- ggplot(expr_scaled,
 p_scaled
 
 ggsave(file.path(out_dir,"TAG synthesis enzymes.png"), p_scaled,height = 6, width = 11)
+```
+
+```{r tag enzymes without Dgat1}
+tag_enzymes_without_dgat1 <- c("Dgat2", "Plpp3", "Agpat2", 
+                 "Lpcat3", "Lpgat1")
+
+expr_subset <- expr_matrix[rownames(expr_matrix) %in% tag_enzymes_without_dgat1, ]
+
+expr_long <- as.data.frame(t(expr_subset))
+expr_long$Sample <- rownames(expr_long)
+
+expr_long <- merge(expr_long,
+                   sample_info[, c("sample_name", "group")],
+                   by.x = "Sample", by.y = "sample_name")
+
+expr_long_melt <- melt(
+  expr_long,
+  id.vars = c("Sample", "group"),
+  variable.name = "Gene",
+  value.name = "Expression"
+)
+
+expr_long_melt$Expression <- as.numeric(expr_long_melt$Expression)
+
+expr_avg <- expr_long_melt %>%
+  group_by(Gene, group) %>%
+  summarise(mean_expr = mean(Expression, na.rm = TRUE),
+            .groups = "drop")
+
+group_order <- c(
+  "Chow-Chow", "Chow-HFHS",
+  "Lactation HFHS-Chow", "Lactation HFHS-HFHS",
+  "Post-weaning HFHS-Chow", "Post-weaning HFHS-HFHS"
+)
+
+expr_avg$group <- factor(expr_avg$group, levels = group_order)
+
+# ------------------------------------------
+# 5. Z-score scaling per gene
+# ------------------------------------------
+expr_scaled <- expr_avg %>%
+  group_by(Gene) %>%
+  mutate(scaled_expr = as.numeric(scale(mean_expr))) %>%
+  ungroup()
+
+
+p_scaled <- ggplot(expr_scaled,
+                   aes(x = group, y = scaled_expr,
+                       color = Gene, group = Gene)) +
+  geom_line(size = 2.0) +
+  geom_point(size = 5) +
+  scale_color_viridis_d(option = "plasma") +
+  theme_classic() +
+  labs(title = "TAG Synthesis Pathway Enzymes",
+       x = "Group",
+       y = "Scaled Expression (Z-score)") +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle =0, hjust = 0.5)
+  )
+
+p_scaled
+
+ggsave(file.path(out_dir,"TAG synthesis enzymes without Dgat1.png"), p_scaled,height = 6, width = 11)
 ```
 
 ```{r}
