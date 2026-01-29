@@ -25,7 +25,7 @@ sample_info_hypo <- Sample_Information_Bulk_Hypothalamus_CHO
 ```
 
 ```{r}
-out_dir <- "output hypothalamus"
+out_dir_hypo <- "output hypothalamus"
 .group_base_colors <- c(
   "Chow-HFHS" = "#000000",
   "Lactation HFHS-HFHS" = "#de5528",
@@ -39,6 +39,7 @@ color_map <- group_aes$color
 group_order <- c("Chow-HFHS","Lactation HFHS-HFHS","Post-weaning  HFHS-HFHS")
 write_xlsx(count_hypo, "read_count_bulk_hypo.xlsx")
 ```
+
 
 ```{r PCA}
 count_hypo <- as.data.frame(count_hypo)
@@ -54,8 +55,9 @@ count_hypo[ , sample_cols] <- lapply(count_hypo[ , sample_cols], function(x){
     as.numeric(as.character(x))
 })
 
-# filter genes
-count_hypo_filtered <- count_hypo[rowSums(count_hypo[ , sample_cols]) > 0, ]
+count_hypo_filtered <- count_hypo[
+  rowSums(count_hypo[, sample_cols] == 0) == 0,
+]
 
 # Set gene names as rownames
 rownames(count_hypo_filtered) <- count_hypo_filtered$gene_name
@@ -99,10 +101,138 @@ pca_hypothalamus <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
   ) +
   theme_bw(base_size = 14)
 
-
+pca_hypothalamus
 ggsave(file.path(out_dir,"PCA Bulk Hypothalamus.png"), pca_hypothalamus, height = 4, width = 7)
 ```
+```{r analyze PC1 loadings}
+pc1_loadings <- pca$rotation[, 1]
 
+pc1_df <- data.frame(
+  gene = names(pc1_loadings),
+  loading = pc1_loadings
+)
+pc1_pos_genes <- pc1_df %>%
+  arrange(desc(loading)) %>%
+  slice_head(n = 500) %>%
+  pull(gene)
+
+pc1_neg_genes <- pc1_df %>%
+  arrange(loading) %>%
+  slice_head(n = 500) %>%
+  pull(gene)
+ego_pc1_pos <- enrichGO(
+  gene = pc1_pos_genes,
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+
+ego_pc1_neg <- enrichGO(
+  gene = pc1_neg_genes,
+  OrgDb = org.Mm.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  readable = TRUE
+)
+dotplot(ego_pc1_pos, showCategory = 30) +
+  ggtitle("PC1-positive loadings")
+
+dotplot(ego_pc1_neg, showCategory = 30) +
+  ggtitle("PC1-negative loadings")
+
+```
+
+```{r gene trajectory plots}
+dds0 <- DESeqDataSetFromMatrix(
+  countData = round(count_hypo_filtered),
+  colData   = sample_info_hypo,
+  design    = ~ group
+)
+
+dds0 <- dds0[rowSums(counts(dds0)) > 10, ]
+dds_lrt <- DESeq(dds0, test = "LRT", reduced = ~1)
+
+res_anova <- results(dds_lrt)
+
+res_anova_sig <- as.data.frame(res_anova) %>%
+  rownames_to_column("gene") %>%
+  filter(padj < 0.05)
+dds_wald <- DESeq(dds0)
+
+res_lact_vs_post <- results(
+  dds_wald,
+  contrast = c("group", "Lactation HFHS-HFHS", "Post-weaning  HFHS-HFHS")
+)
+res_lact_vs_post <- as.data.frame(res_lact_vs_post)
+res_lact_vs_post_df <- res_lact_vs_post %>%
+  tibble::rownames_to_column("gene")
+
+res_lact_vs_post_df <- dplyr::select(
+  res_lact_vs_post_df,
+  gene,
+  log2FoldChange
+)
+
+res_chow_vs_post <- results(
+  dds_wald,
+  contrast = c("group", "Chow-HFHS", "Post-weaning  HFHS-HFHS")
+)
+
+
+res_chow_vs_post <- as.data.frame(res_chow_vs_post)
+res_chow_vs_post_df <- res_chow_vs_post %>%
+  tibble::rownames_to_column("gene")
+
+res_chow_vs_post_df <- dplyr::select(
+  res_chow_vs_post_df,
+  gene,
+  log2FoldChange
+)
+
+res_lact_vs_post_df <- res_lact_vs_post
+res_lact_vs_post_df$gene <- rownames(res_lact_vs_post_df)
+
+res_lact_vs_post_df <- res_lact_vs_post_df[, c("gene", "log2FoldChange")]
+
+res_chow_vs_post_df <- res_chow_vs_post
+res_chow_vs_post_df$gene <- rownames(res_chow_vs_post_df)
+
+res_chow_vs_post_df <- res_chow_vs_post_df[, c("gene", "log2FoldChange")]
+
+res_anova_fc <- res_anova_sig %>%
+  dplyr::select(gene, padj) %>%
+  left_join(
+    res_lact_vs_post_df %>%
+      dplyr::rename(log2FC_Lact_vs_Post = log2FoldChange),
+    by = "gene"
+  ) %>%
+  left_join(
+    {
+      df <- res_chow_vs_post
+      df$gene <- rownames(df)
+      df[, c("gene", "log2FoldChange")] %>%
+        dplyr::rename(log2FC_Chow_vs_Post = log2FoldChange)
+    },
+    by = "gene"
+  )
+
+
+log2FC_cutoff <-0.00001 # adjust if needed
+
+# Post-weaning upregulated (Post > both Chow and Lactation)
+post_specific_up <- res_anova_fc[
+  res_anova_fc$log2FC_Lact_vs_Post < -log2FC_cutoff &
+  res_anova_fc$log2FC_Chow_vs_Post < -log2FC_cutoff, ]
+
+# Post-weaning downregulated (Post < both Chow and Lactation)
+post_specific_down <- res_anova_fc[
+  res_anova_fc$log2FC_Lact_vs_Post > log2FC_cutoff &
+  res_anova_fc$log2FC_Chow_vs_Post > log2FC_cutoff, ]
+
+```
 
 ```{r t-test chow vs lactation}
 dds <- DESeqDataSetFromMatrix(
@@ -118,6 +248,7 @@ res_lact_vs_chow <- results(
     contrast = c("group", "Lactation HFHS-HFHS", "Chow-HFHS")
 )
 
+res_lact_vs_chow <- as.data.frame(res_lact_vs_chow)
 sig_genes <- res_lact_vs_chow[res_lact_vs_chow$padj < 0.05, ]
 nrow(sig_genes)
 res_df_lact_chow <- as.data.frame(res_lact_vs_chow)
@@ -125,12 +256,151 @@ head(res_df_lact_chow)
 
 res_df_lact_chow <- as.data.frame(res_lact_vs_chow)
 
-deg_up_lact <- res_df_lact_chow  %>%
-  filter(padj < 0.05, log2FoldChange > 0)
+deg_up_lact_chow_t <- res_df_lact_chow  %>%
+  filter(padj < 0.05, log2FoldChange >0)
 
-deg_down_lact <- res_df_lact_chow %>%
-  filter(padj < 0.05, log2FoldChange < 0)
-deg_up_lact
+deg_down_lact_chow_t <- res_df_lact_chow %>%
+  filter(padj < 0.05, log2FoldChange < -0.0000001)
+```
+
+```{r identigy genes that are only different in lactation compared to the other two}
+# --- 1. Create DESeq2 dataset ---
+dds <- DESeqDataSetFromMatrix(
+  countData = round(count_hypo_filtered),   # round counts just in case
+  colData = sample_info_hypo,
+  design = ~ group
+)
+
+# Filter out low-count genes (optional but recommended)
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+# --- 2. Run DESeq2 ---
+dds <- DESeq(dds)
+
+# --- 3. Compute pairwise contrasts for Lactation ---
+res_lact_vs_chow <- results(dds, contrast = c("group", "Lactation HFHS-HFHS", "Chow-HFHS"))
+res_lact_vs_post <- results(dds, contrast = c("group", "Lactation HFHS-HFHS", "Post-weaning  HFHS-HFHS"))
+
+# --- 4. Convert results to long format and add contrast labels ---
+res_lact_vs_chow <- as.data.frame(res_lact_vs_chow) %>%
+  rownames_to_column("gene") %>%
+  mutate(contrast = "Lact_vs_Chow")
+
+res_lact_vs_post <- as.data.frame(res_lact_vs_post) %>%
+  rownames_to_column("gene") %>%
+  mutate(contrast = "Lact_vs_Post")
+
+res_long <- bind_rows(res_lact_vs_chow, res_lact_vs_post)
+
+res_wide <- res_long %>%
+  pivot_wider(
+    id_cols = gene,                     # ensure gene is the unique identifier
+    names_from = contrast, 
+    values_from = c(log2FoldChange, padj)
+  )
+
+
+# --- 7. Identify Lactation-specific genes ---
+log2FC_cutoff <- 0.00001
+padj_cutoff <- 0.05
+
+lactation_specific_up <- res_wide %>%
+  filter(
+    log2FoldChange_Lact_vs_Chow > log2FC_cutoff & padj_Lact_vs_Chow < padj_cutoff,
+    log2FoldChange_Lact_vs_Post > log2FC_cutoff & padj_Lact_vs_Post < padj_cutoff
+  )
+
+lactation_specific_down <- res_wide %>%
+  filter(
+    log2FoldChange_Lact_vs_Chow < -log2FC_cutoff & padj_Lact_vs_Chow < padj_cutoff,
+    log2FoldChange_Lact_vs_Post < -log2FC_cutoff & padj_Lact_vs_Post < padj_cutoff
+  )
+
+```
+
+```{r ANOVA}
+dds <- DESeqDataSetFromMatrix(
+  countData = round(count_hypo_filtered),
+  colData = sample_info_hypo,
+  design = ~ group
+)
+
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+dds <- DESeq(
+  dds,
+  test = "LRT",
+  reduced = ~ 1
+)
+res_lrt <- results(dds)
+
+res_lrt <- as.data.frame(res_lrt) %>%
+  rownames_to_column("gene")
+
+anova_sig_genes <- res_lrt %>%
+  filter(padj < 0.05)
+res_lact_vs_chow <- results(dds, contrast = c("group", "Lactation HFHS-HFHS", "Chow-HFHS"), test = "Wald")
+res_lact_vs_post <- results(dds, contrast = c("group", "Lactation HFHS-HFHS", "Post-weaning  HFHS-HFHS"), test = "Wald")
+
+res_fc <- as.data.frame(res_lact_vs_chow) %>%
+  rownames_to_column("gene") %>%
+  dplyr::select(gene, log2FoldChange) %>%
+  dplyr::rename(log2FC_Lact_vs_Chow = log2FoldChange) %>%
+  inner_join(
+    as.data.frame(res_lact_vs_post) %>%
+      rownames_to_column("gene") %>%
+      dplyr::select(gene, log2FoldChange) %>%
+      dplyr::rename(log2FC_Lact_vs_Post = log2FoldChange),
+    by = "gene"
+  )
+
+res_anova_fc <- anova_sig_genes %>%
+  inner_join(res_fc, by = "gene")
+
+log2FC_cutoff <- 0.0000001
+
+lactation_specific_up_anova <- res_anova_fc %>%
+  filter(
+    log2FC_Lact_vs_Chow > log2FC_cutoff,
+    log2FC_Lact_vs_Post > log2FC_cutoff
+  )
+
+lactation_specific_down_anova <- res_anova_fc %>%
+  filter(
+    log2FC_Lact_vs_Chow < -log2FC_cutoff,
+    log2FC_Lact_vs_Post < -log2FC_cutoff
+  )
+
+genes_up <- lactation_specific_up_anova$gene
+genes_down <- lactation_specific_down_anova$gene
+gene_universe <- res_anova_fc$gene
+
+ego_up_anova <- enrichGO(
+  gene          = genes_up,
+  universe      = gene_universe,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ego_down_anova <- enrichGO(
+  gene          = genes_down,
+  universe      = gene_universe,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+go_up_df <- as.data.frame(ego_up_anova)
+go_down_df <- as.data.frame(ego_down_anova)
 ```
 
 ```{r lets compare up vs down 15% of the GO terms are related to protein folding, ER stress}
@@ -221,7 +491,7 @@ top10_GO<- ggplot(go_top10_combined,
         )
 
 ggsave(
-  filename = "GO_enrichment_up_down.png",
+  filename = file.path(out_dir_hypo,"GO_enrichment_bp_up_down.png"),
   plot = top10_GO,
   width = 16,
   height = 8,
@@ -294,6 +564,291 @@ ggsave(
   dpi = 300
 )
 ```
+
+```{r }
+library(tidyverse)
+
+go_bp_focus_df <- as.data.frame(go_bp_up_focus) %>%
+  dplyr::select(Description, geneID) %>%
+  separate_rows(geneID, sep = "/") %>%
+  dplyr::rename(
+    go_term = Description,
+    gene = geneID
+  )
+
+res_df_lact_chow <- res_df_lact_chow %>%
+  tibble::rownames_to_column(var = "gene")  # converts rownames to column 'gene'
+
+go_bp_focus_df <- go_bp_focus_df %>%
+  left_join(res_df_lact_chow %>% dplyr::select(gene, log2FoldChange), by = "gene")
+
+circos.clear()
+circos.par(
+  start.degree = 90,
+  gap.after = c(
+    rep(2, length(unique(go_bp_focus_df$go_term)) - 1),
+    8,
+    rep(1, length(unique(go_bp_focus_df$gene)) - 1),
+    8
+  )
+)
+
+go_terms <- unique(go_bp_focus_df$go_term)
+go_cols <- setNames(
+  colorRampPalette(RColorBrewer::brewer.pal(8, "Set2"))(length(go_terms)),
+  go_terms
+)
+gene_fc <- go_bp_focus_df %>%
+  distinct(gene, log2FoldChange)
+
+fc_col_fun <- colorRamp2(
+  c(min(gene_fc$log2FoldChange),
+    0,
+    max(gene_fc$log2FoldChange)),
+  c("#2A7FFF", "white", "#C73E1D")
+)
+
+gene_cols <- setNames(
+  fc_col_fun(gene_fc$log2FoldChange),
+  gene_fc$gene
+)
+chordDiagram(
+  go_bp_focus_df %>% dplyr::select(go_term, gene),
+  grid.col = c(go_cols, gene_cols),
+  transparency = 0.4
+)
+circos.trackPlotRegion(
+  track.index = 1,
+  panel.fun = function(x, y) {
+    circos.text(
+      CELL_META$xcenter,
+      CELL_META$ylim[1],
+      CELL_META$sector.index,
+      facing = "clockwise",
+      niceFacing = TRUE,
+      adj = c(0, 0.5),
+      cex = 0.6
+    )
+  },
+  bg.border = NA
+)
+
+```
+
+```{r cc}
+go_cc_up <- enrichGO(
+  gene          = up_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+go_cc_down <- enrichGO(
+  gene          = down_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+keywords <- c(
+    "endoplasmic",
+    "reticulum",
+    "ribosome",
+    "unfolded",
+    "vesicle",
+    "protein",
+    "misfolded", 
+    "transport", 
+    "ribosomal", 
+    "lysosomal"
+)
+go_cc_up_df <- as.data.frame(go_cc_up)
+go_cc_down_df <- as.data.frame(go_cc_down)
+
+top10_up <- go_cc_up_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Upregulated")
+
+top10_down <- go_cc_down_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Downregulated")
+
+go_top10_combined <- bind_rows(top10_up, top10_down)
+
+top10_GO_cc<- ggplot(go_top10_combined,
+             aes(x = reorder(Description, -log10(p.adjust)),
+                 y = -log10(p.adjust),
+                 fill = direction)) +
+        geom_col(width = 0.7) +
+        coord_flip() +
+        facet_wrap(~ direction, scales = "free_y") +
+        scale_fill_manual(values = c(
+          "Upregulated"   = "#C73E1D",
+          "Downregulated" = "#2A7FFF"
+        )) +
+        labs(
+          title = "Top 10 GO CC Terms in Up- and Downregulated Genes",
+          x = NULL,
+          y = expression(-log[10]("adjusted p-value")),
+          fill = NULL
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5)
+        )
+
+ggsave(
+  filename = file.path(out_dir_hypo, "GO_enrichment_cc_up_down.png"),
+  plot = top10_GO_cc,
+  width = 16,
+  height = 8,
+  dpi = 300
+)
+
+
+go_cc_up_focus <- go_cc_up_df %>%
+  filter(grepl(paste(keywords, collapse = "|"),
+               Description, ignore.case = TRUE))
+
+go_cc_down_focus <- go_cc_down_df %>%
+  filter(grepl(paste(keywords, collapse = "|"),
+               Description, ignore.case = TRUE))
+
+n_focus <- nrow(go_cc_up_focus)
+n_total <- nrow(go_cc_up_df)
+
+prop_label <- paste0(
+  n_focus, " / ", n_total,
+  " GO CC terms\n(~",
+  round(100 * n_focus / n_total), "%)"
+)
+
+go_cc_up_focus %>%
+  mutate(
+    neglog10_padj = -log10(p.adjust),
+    Description = reorder(Description, neglog10_padj)
+  ) %>%
+  ggplot(aes(
+    x = neglog10_padj,
+    y = Description,
+    size = Count
+  )) +
+  geom_point(color = "#C73E1D", alpha = 0.85) +
+  labs(
+    title = "ER Stress / Protein Folding–Related GO CC Terms",
+    subtitle = prop_label,
+    x = expression(-log[10]("adjusted p-value")),
+    y = NULL,
+    size = "Gene count"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+```
+
+```{r mf}
+go_mf_up <- enrichGO(
+  gene          = up_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+go_mf_down <- enrichGO(
+  gene          = down_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+keywords <- c(
+    "endoplasmic",
+    "reticulum",
+    "ribosome",
+    "unfolded",
+    "vesicle",
+    "protein",
+    "misfolded", 
+    "transport", 
+    "ribosomal", 
+    "lysosomal"
+)
+
+go_mf_up_df <- as.data.frame(go_mf_up)
+go_mf_down_df <- as.data.frame(go_mf_down)
+
+top10_up <- go_mf_up_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Upregulated")
+
+top10_down <- go_mf_down_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Downregulated")
+
+go_top10_combined <- bind_rows(top10_up, top10_down)
+
+top10_GO_mf<- ggplot(go_top10_combined,
+             aes(x = reorder(Description, -log10(p.adjust)),
+                 y = -log10(p.adjust),
+                 fill = direction)) +
+        geom_col(width = 0.7) +
+        coord_flip() +
+        facet_wrap(~ direction, scales = "free_y") +
+        scale_fill_manual(values = c(
+          "Upregulated"   = "#C73E1D",
+          "Downregulated" = "#2A7FFF"
+        )) +
+        labs(
+          title = "Top 10 GO MF Terms in Up- and Downregulated Genes",
+          x = NULL,
+          y = expression(-log[10]("adjusted p-value")),
+          fill = NULL
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5)
+        )
+
+ggsave(
+  filename = file.path(out_dir_hypo, "GO_enrichment_mf_up_down.png"),
+  plot = top10_GO_mf,
+  width = 16,
+  height = 8,
+  dpi = 300
+)
+
+go_mf_up_focus <- go_mf_up_df %>%
+  filter(grepl(paste(keywords, collapse = "|"),
+               Description, ignore.case = TRUE))
+
+go_mf_down_focus <- go_mf_down_df %>%
+  filter(grepl(paste(keywords, collapse = "|"),
+               Description, ignore.case = TRUE))
+
+```
+
 
 ```{r genes driving GO}
 library(tidyr)
@@ -813,247 +1368,6 @@ ggsave(
 
 ```
 
-```{r KEGG}
-# 1️⃣ Get Entrez IDs from significant DEGs
-deg_symbols <- rownames(sig_genes)
-nrow(sig_genes)
-deg_entrez <- bitr(
-  deg_symbols,
-  fromType = "SYMBOL",
-  toType = "ENTREZID",
-  OrgDb = org.Mm.eg.db
-)$ENTREZID
-
-# 2️⃣ KEGG enrichment
-kegg_enrich <- enrichKEGG(
-  gene          = deg_entrez,
-  organism      = "mmu",
-  keyType       = "ncbi-geneid",
-  pvalueCutoff  = 0.05,
-  pAdjustMethod = "BH",
-  qvalueCutoff  = 0.05
-)
-
-# 3️⃣ Make gene symbols readable
-kegg_enrich <- setReadable(kegg_enrich, OrgDb = org.Mm.eg.db, keyType = "ENTREZID")
-
-# 4️⃣ Dotplot
-p_kegg <- dotplot(kegg_enrich, showCategory = 20) +
-  ggtitle("KEGG Pathway Enrichment (DEGs)")
-
-# 5️⃣ Save figure
-ggsave(
-  filename = file.path(out_dir, "KEGG_DEGs_dotplot.png"),
-  plot = p_kegg,
-  width = 6,
-  height = 6,
-  dpi = 300
-)
-
-```
-
-```{r FOXO enriched?}
-# Make sure your KEGG enrichment object exists
-# kegg_enrich <- enrichKEGG(...)
-
-# Convert to data frame
-kegg_df <- as.data.frame(kegg_enrich)
-
-# Filter for FoxO signaling pathway
-foxo_row <- kegg_df[kegg_df$Description == "FoxO signaling pathway - Mus musculus (house mouse)", ]
-
-if(nrow(foxo_row) == 0){
-  stop("FoxO signaling pathway not found in enrichment results.")
-}
-
-# geneID column has ENTREZ IDs separated by "/"
-foxo_genes_symbols <- unlist(strsplit(foxo_row$geneID, "/"))
-
-vsd <- vst(dds, blind = TRUE)
-vsd_mat <- assay(vsd)
-
-foxo_expr <- vsd_mat[rownames(vsd_mat) %in% foxo_genes_symbols, ]
-
-# Convert to long format and merge with sample info
-expr_long <- as.data.frame(foxo_expr) %>%
-  tibble::rownames_to_column("Gene") %>%
-  tidyr::pivot_longer(-Gene, names_to = "Sample", values_to = "Expression") %>%
-  left_join(sample_info_hypo[, c("sample_name", "group")],
-            by = c("Sample" = "sample_name"))
-
-# Compute mean expression per gene per group
-expr_avg <- expr_long %>%
-  group_by(Gene, group) %>%
-  summarise(mean_expr = mean(Expression, na.rm = TRUE), .groups = "drop") %>%
-  tidyr::pivot_wider(names_from = group, values_from = mean_expr) %>%
-  column_to_rownames("Gene") %>%
-  as.matrix()
-
-# Row-wise Z-score scaling
-expr_scaled <- t(scale(t(expr_avg)))
-
-# Column annotation
-annotation_col <- data.frame(group = colnames(expr_scaled))
-rownames(annotation_col) <- colnames(expr_scaled)
-
-ann_colors <- list(group = group_colors)
-
-
-pdf(
-  file.path(out_dir, "FoxO Signaling Pathway Genes DEG Heatmap.pdf"),
-  width = 8,
-  height = 9
-)
-
-pheatmap(
-  expr_scaled,
-  cluster_rows = TRUE,
-  cluster_cols = FALSE,  # grouped columns
-  annotation_col = annotation_col,
-  annotation_colors = ann_colors,
-  fontsize_row = 8,
-  main = "FoxO Signaling Pathway Genes (DEGs)"
-)
-dev.off()
-```
-
-```{r leaning edge genes of GABA}
-bp_df <- as.data.frame(gsea_bp)
-
-target_term <- "cerebral cortex GABAergic interneuron differentiation"
-
-bp_row <- bp_df[bp_df$Description == target_term, ]
-
-if (nrow(bp_row) == 0) {
-  stop("Target GO term not found in GSEA results.")
-}
-
-leading_edge_entrez <- unlist(strsplit(bp_row$core_enrichment, "/"))
-
-leading_edge_symbols <- bitr(
-  leading_edge_entrez,
-  fromType = "ENTREZID",
-  toType   = "SYMBOL",
-  OrgDb    = org.Mm.eg.db
-)$SYMBOL
-
-vsd_mat <- assay(vsd)
-
-le_expr <- vsd_mat[rownames(vsd_mat) %in% leading_edge_symbols, ]
-
-le_expr <- le_expr[leading_edge_symbols, , drop = FALSE]
-le_expr_scaled <- t(scale(t(le_expr)))
-
-annotation_col <- data.frame(
-  group = sample_info_hypo$group
-)
-rownames(annotation_col) <- sample_info_hypo$sample_name
-
-ann_colors <- list(group = group_colors)
-
-pdf(
-  file.path(out_dir, "GSEA_BP_GABAergic_Interneuron_Differentiation_Heatmap.pdf"),
-  width = 8,
-  height = 9
-)
-
-pheatmap(
-  le_expr_scaled,
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  annotation_col = annotation_col,
-  annotation_colors = ann_colors,
-  fontsize_row = 9,
-  main = paste0(
-    "Leading-edge genes:\n",
-    "cerebral cortex GABAergic interneuron differentiation"
-  )
-)
-
-dev.off()
-
-res_subset <- res_chow_lact[
-  rownames(res_chow_lact) %in% leading_edge_symbols,
-]
-
-res_subset <- res_subset[
-  order(res_subset$log2FoldChange, decreasing = TRUE),
-]
-
-write.csv(
-  as.data.frame(res_subset),
-  file.path(out_dir, "GABAergic_Interneuron_Differentiation_LeadingEdge_DESeq2.csv")
-)
-```
-
-```{r neuron diff}
-bp_df <- as.data.frame(gsea_bp)
-
-target_term <- "cerebral cortex neuron differentiation"
-
-bp_row <- bp_df[bp_df$Description == target_term, ]
-
-if (nrow(bp_row) == 0) {
-  stop("Target GO term not found in GSEA results.")
-}
-
-leading_edge_entrez <- unlist(strsplit(bp_row$core_enrichment, "/"))
-
-leading_edge_symbols <- bitr(
-  leading_edge_entrez,
-  fromType = "ENTREZID",
-  toType   = "SYMBOL",
-  OrgDb    = org.Mm.eg.db
-)$SYMBOL
-
-vsd_mat <- assay(vsd)
-
-le_expr <- vsd_mat[rownames(vsd_mat) %in% leading_edge_symbols, ]
-
-le_expr <- le_expr[leading_edge_symbols, , drop = FALSE]
-le_expr_scaled <- t(scale(t(le_expr)))
-
-annotation_col <- data.frame(
-  group = sample_info_hypo$group
-)
-rownames(annotation_col) <- sample_info_hypo$sample_name
-
-ann_colors <- list(group = group_colors)
-
-pdf(
-  file.path(out_dir, "GSEA_BP_cerebral_cortex_neuron_differentiation_Heatmap.pdf"),
-  width = 8,
-  height = 9
-)
-
-pheatmap(
-  le_expr_scaled,
-  cluster_rows = TRUE,
-  cluster_cols = TRUE,
-  annotation_col = annotation_col,
-  annotation_colors = ann_colors,
-  fontsize_row = 9,
-  main = paste0(
-    "Leading-edge genes:\n",
-    "cerebral cortex neuron differentiation"
-  )
-)
-
-dev.off()
-
-res_subset <- res_chow_lact[
-  rownames(res_chow_lact) %in% leading_edge_symbols,
-]
-
-res_subset <- res_subset[
-  order(res_subset$log2FoldChange, decreasing = TRUE),
-]
-
-write.csv(
-  as.data.frame(res_subset),
-  file.path(out_dir, "cerebral_cortex_neuron_differentiation_LeadingEdge_DESeq2.csv")
-)
-```
 
 ```{r leptin signaling pathway}
 go_leptin <- keggGet("GO:0044321")[[1]]$GENE
