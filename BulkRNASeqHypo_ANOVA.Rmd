@@ -1,0 +1,349 @@
+---
+title: "Hypothalamus BulkRNA-seq Analysis"
+output: html_notebook
+---
+
+```{r load setup}
+library(dplyr); library(tidyr); library(ggplot2); library(rstatix)
+library(pheatmap); library(clusterProfiler); library(org.Mm.eg.db)
+library(glmnet); library(VennDiagram); library(grid); library(writexl)
+library(VennDiagram);library(forcats);library(ggrepel); library(DESeq2)
+library(reshape2);library(tidyverse); library(AnnotationDbi); library(GO.db)
+library(viridis); library(enrichplot)
+```
+
+
+
+```{r import read count matrix}
+count_hypo <- gene_count
+sample_info_hypo <- Sample_Information_Bulk_Hypothalamus_CHO
+```
+
+```{r}
+out_dir_hypo <- "output hypothalamus"
+.group_base_colors <- c(
+  "Chow-HFHS" = "#000000",
+  "Lactation HFHS-HFHS" = "#de5528",
+  "Post-weaning  HFHS-HFHS" = "#208696"
+)
+
+group_aes <- get_group_aesthetics(names(.group_base_colors))
+fill_map <- group_aes$fill
+color_map <- group_aes$color
+
+group_order <- c("Chow-HFHS","Lactation HFHS-HFHS","Post-weaning  HFHS-HFHS")
+#write_xlsx(count_hypo, "read_count_bulk_hypo.xlsx")
+```
+
+
+```{r PCA}
+count_hypo <- as.data.frame(count_hypo)
+count_hypo$gene_name <- make.unique(count_hypo$gene_name, sep = "_dup")
+rownames(count_hypo) <- count_hypo$gene_name
+# Identify sample columns using sample_info_hypo
+sample_cols <- intersect(colnames(count_hypo), sample_info_hypo$sample_name)
+
+sample_cols <- intersect(colnames(count_hypo), sample_info_hypo$sample_name)
+
+# ensure numeric sample columns
+count_hypo[ , sample_cols] <- lapply(count_hypo[ , sample_cols], function(x){
+    as.numeric(as.character(x))
+})
+
+count_hypo_filtered <- count_hypo[
+  rowSums(count_hypo[, sample_cols] == 0) == 0,
+]
+
+# Set gene names as rownames
+rownames(count_hypo_filtered) <- count_hypo_filtered$gene_name
+count_hypo_filtered <- count_hypo_filtered[ , !(colnames(count_hypo) == "gene_name")]
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(count_hypo_filtered),
+  colData   = sample_info_hypo,
+  design    = ~ group
+)
+
+vst_mat <- vst(dds, blind = TRUE)
+pca_mat <- assay(vst_mat)
+pca <- prcomp(t(pca_mat), scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1   = pca$x[,1],
+  PC2   = pca$x[,2],
+  group = sample_info_hypo$group,
+  sample = sample_info_hypo$sample_name
+)
+
+# Percent variance
+var_expl <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 2)
+
+group_colors <- c(
+  "Chow-HFHS" = "#000000",      
+  "Post-weaning  HFHS-HFHS" = "#208696", 
+  "Lactation HFHS-HFHS" = "#de5528"   
+)
+
+pca_hypothalamus <- ggplot(pca_df, aes(x = PC1, y = PC2, color = group)) +
+  geom_point(size = 4) +
+  stat_ellipse(aes(fill = group), geom = "polygon", alpha = 0.15, color = NA) +
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+  labs(
+    title = "PCA of Hypothalamus Samples",
+    x = paste0("PC1 (", var_expl[1], "%)"),
+    y = paste0("PC2 (", var_expl[2], "%)")
+  ) +
+  theme_bw(base_size = 14)
+
+pca_hypothalamus
+ggsave(file.path(out_dir_hypo,"PCA Bulk Hypothalamus.png"), pca_hypothalamus, height = 4, width = 7)
+```
+
+```{r anova}
+dds0 <- DESeqDataSetFromMatrix(
+  countData = round(count_hypo_filtered),
+  colData   = sample_info_hypo,
+  design    = ~ group
+)
+
+dds0 <- dds0[rowSums(counts(dds0)) > 10, ]
+dds_lrt <- DESeq(dds0, test = "LRT", reduced = ~1)
+
+res_anova <- results(dds_lrt)
+
+res_anova_sig <- as.data.frame(res_anova) %>%
+  rownames_to_column("gene") %>%
+  filter(padj < 0.05)
+
+dds_wald <- DESeq(dds0)
+
+res_lact_vs_post <- results(
+  dds_wald,
+  contrast = c("group", "Lactation HFHS-HFHS", "Post-weaning  HFHS-HFHS")
+)
+res_lact_vs_post <- as.data.frame(res_lact_vs_post)
+res_lact_vs_post_df <- res_lact_vs_post %>%
+  tibble::rownames_to_column("gene")
+
+res_lact_vs_post_df <- dplyr::select(
+  res_lact_vs_post_df,
+  gene,
+  log2FoldChange
+)
+
+res_chow_vs_post <- results(
+  dds_wald,
+  contrast = c("group", "Chow-HFHS", "Post-weaning  HFHS-HFHS")
+)
+
+
+res_chow_vs_post <- as.data.frame(res_chow_vs_post)
+res_chow_vs_post_df <- res_chow_vs_post %>%
+  tibble::rownames_to_column("gene")
+
+res_chow_vs_post_df <- dplyr::select(
+  res_chow_vs_post_df,
+  gene,
+  log2FoldChange
+)
+
+res_lact_vs_post_df <- res_lact_vs_post
+res_lact_vs_post_df$gene <- rownames(res_lact_vs_post_df)
+
+res_lact_vs_post_df <- res_lact_vs_post_df[, c("gene", "log2FoldChange")]
+
+res_chow_vs_post_df <- res_chow_vs_post
+res_chow_vs_post_df$gene <- rownames(res_chow_vs_post_df)
+
+res_chow_vs_post_df <- res_chow_vs_post_df[, c("gene", "log2FoldChange")]
+
+res_anova_fc <- res_anova_sig %>%
+  dplyr::select(gene, padj) %>%
+  left_join(
+    res_lact_vs_post_df %>%
+      dplyr::rename(log2FC_Lact_vs_Post = log2FoldChange),
+    by = "gene"
+  ) %>%
+  left_join(
+    {
+      df <- res_chow_vs_post
+      df$gene <- rownames(df)
+      df[, c("gene", "log2FoldChange")] %>%
+        dplyr::rename(log2FC_Chow_vs_Post = log2FoldChange)
+    },
+    by = "gene"
+  )
+
+
+log2FC_cutoff <-0.00001 # adjust if needed
+
+# Post-weaning upregulated (Post > both Chow and Lactation)
+post_specific_up <- res_anova_fc[
+  res_anova_fc$log2FC_Lact_vs_Post < -log2FC_cutoff &
+  res_anova_fc$log2FC_Chow_vs_Post < -log2FC_cutoff, ]
+
+# Post-weaning downregulated (Post < both Chow and Lactation)
+post_specific_down <- res_anova_fc[
+  res_anova_fc$log2FC_Lact_vs_Post > log2FC_cutoff &
+  res_anova_fc$log2FC_Chow_vs_Post > log2FC_cutoff, ]
+
+```
+
+```{r}
+gsea_rank <- as.data.frame(res_anova) %>%
+  rownames_to_column("gene") %>%
+  filter(!is.na(stat)) %>%
+  arrange(desc(stat)) %>%
+  dplyr::select(gene, stat)
+
+gene_list <- gsea_rank$stat
+
+names(gene_list) <- gsea_rank$gene
+
+gsea_go <- gseGO(
+  geneList     = gene_list,
+  OrgDb        = org.Mm.eg.db,
+  keyType      = "SYMBOL",
+  ont          = "BP",
+  minGSSize    = 10,
+  maxGSSize    = 500,
+  pvalueCutoff = 0.05,
+  verbose      = FALSE
+)
+
+dotplot(gsea_go, showCategory = 15) +
+  ggtitle("GSEA using ANOVA statistic (3 groups)")
+```
+
+```{r leading edge genes}
+# Filter GSEA results
+gsea_go_filt <- gsea_go
+gsea_go_filt@result <- gsea_go_filt@result %>%
+  dplyr::filter(p.adjust < 0.05, abs(NES) > 1.2) %>%
+  slice_head(n = 50)  # top 20 GO terms
+
+# -------------------------------
+# 6. Extract leading-edge genes
+# -------------------------------
+leading_edge <- gsea_go_filt@result %>%
+  dplyr::select(ID, Description, core_enrichment) %>%
+  separate_rows(core_enrichment, sep = "/") %>%
+  dplyr::rename(gene = core_enrichment)
+```
+
+```{r}
+# -------------------------------
+# 7. Prepare expression matrix in long format
+# -------------------------------
+expr_df <- count_hypo_filtered %>% rownames_to_column("gene")
+
+expr_long <- expr_df %>%
+  pivot_longer(
+    cols = -gene,
+    names_to = "sample",
+    values_to = "expression"
+  ) %>%
+  left_join(
+    sample_info_hypo %>% dplyr::rename(sample = sample_name) %>% dplyr::select(sample, group),
+    by = "sample"
+  )
+```
+
+```{r leading edge subset}
+# -------------------------------
+# 8. Subset to leading-edge genes
+# -------------------------------
+expr_leading <- expr_long %>%
+  filter(gene %in% leading_edge$gene) %>%
+  left_join(leading_edge, by = "gene")
+
+# -------------------------------
+# 9. Summarize mean expression per gene per group
+# -------------------------------
+expr_summary <- expr_leading %>%
+  group_by(gene, group, Description) %>%
+  summarise(mean_expr = mean(expression), .groups = "drop")
+```
+```{r}
+go_gene_mat <- leading_edge %>%
+  distinct(Description, gene) %>%
+  mutate(present = 1) %>%
+  pivot_wider(
+    names_from = gene,
+    values_from = present,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Description")
+jaccard_dist <- proxy::dist(
+  go_gene_mat,
+  method = "Jaccard"
+)
+
+hc_go <- hclust(jaccard_dist, method = "average")
+
+k <- 10
+go_clusters <- cutree(hc_go, k = k)
+
+go_cluster_df <- data.frame(
+  Description = names(go_clusters),
+  go_cluster = go_clusters
+)
+
+gsea_go_filt@result <- gsea_go_filt@result %>%
+  left_join(go_cluster_df, by = "Description")
+
+go_representatives <- gsea_go_filt@result %>%
+  group_by(go_cluster) %>%
+  slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(go_cluster)
+
+dend_order <- hc_go$order
+ordered_terms <- rownames(go_gene_mat)[dend_order]
+
+cluster_ordered <- data.frame(
+  Description = ordered_terms,
+  go_cluster = go_clusters[ordered_terms],
+  x = seq_along(ordered_terms)
+)
+cluster_xpos <- cluster_ordered %>%
+  group_by(go_cluster) %>%
+  summarise(
+    x = mean(x),
+    .groups = "drop"
+  ) %>%
+  left_join(
+    go_representatives %>%
+      dplyr::select(go_cluster, Description),
+    by = "go_cluster"
+  )
+
+png(
+  file.path(out_dir_hypo,
+            "GO_term_clustering_gene_overlap_ANOVA_ranking_GSEA.png"),
+  width = 15,
+  height = 8,
+  units = "in",
+  res = 300
+)
+
+par(xpd = NA, mar = c(5, 5, 16, 10))
+
+plot(hc_go, labels = FALSE,
+     main = "")
+
+rect.hclust(hc_go, k = 10, border = "red")
+
+text(
+  x = cluster_xpos$x,
+  y = max(hc_go$height) * 1.02,
+  labels = cluster_xpos$Description,
+  srt = 35,
+  adj = 0,
+  cex = 0.95
+)
+
+dev.off()
+```
+

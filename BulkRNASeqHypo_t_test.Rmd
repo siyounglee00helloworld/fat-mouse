@@ -1,0 +1,321 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(GOplot)
+```
+
+```{r import read count matrix}
+count_hypo <- gene_count
+sample_info_hypo <- Sample_Information_Bulk_Hypothalamus_CHO
+```
+
+```{r}
+out_dir_hypo <- "output hypothalamus"
+.group_base_colors <- c(
+  "Chow-HFHS" = "#000000",
+  "Lactation HFHS-HFHS" = "#de5528",
+  "Post-weaning  HFHS-HFHS" = "#208696"
+)
+
+group_aes <- get_group_aesthetics(names(.group_base_colors))
+fill_map <- group_aes$fill
+color_map <- group_aes$color
+
+group_order <- c("Chow-HFHS","Lactation HFHS-HFHS","Post-weaning  HFHS-HFHS")
+#write_xlsx(count_hypo, "read_count_bulk_hypo.xlsx")
+```
+
+```{r t-test chow vs lactation}
+dds <- DESeqDataSetFromMatrix(
+    countData = round(count_hypo_filtered),
+    colData   = sample_info_hypo,
+    design    = ~ group
+)
+
+dds <- DESeq(dds)
+
+res_lact_vs_chow <- results(
+    dds,
+    contrast = c("group", "Lactation HFHS-HFHS", "Chow-HFHS")
+)
+
+res_lact_vs_chow <- as.data.frame(res_lact_vs_chow)
+sig_genes <- res_lact_vs_chow[res_lact_vs_chow$padj < 0.05, ]
+nrow(sig_genes)
+res_df_lact_chow <- as.data.frame(res_lact_vs_chow)
+head(res_df_lact_chow)
+
+res_df_lact_chow <- as.data.frame(res_lact_vs_chow)
+
+deg_up_lact_chow_t <- res_df_lact_chow  %>%
+  filter(padj < 0.05, log2FoldChange >0)
+
+deg_down_lact_chow_t <- res_df_lact_chow %>%
+  filter(padj < 0.05, log2FoldChange < -0.0000001)
+```
+
+```{r}
+
+# UP genes
+up_symbols <- rownames(deg_up_lact_chow_t)
+up_entrez <- bitr(
+  up_symbols,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)$ENTREZID
+
+# DOWN genes
+down_symbols <- rownames(deg_down_lact_chow_t)
+down_entrez <- bitr(
+  down_symbols,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)$ENTREZID
+
+go_bp_up <- enrichGO(
+  gene          = up_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+go_bp_down <- enrichGO(
+  gene          = down_entrez,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+keywords <- c(
+    "endoplasmic reticulum",
+    "unfolded",
+    "protein",
+    "misfolded",
+    "proteostasis",
+    "ER stress"
+)
+go_bp_up_df <- as.data.frame(go_bp_up)
+go_bp_down_df <- as.data.frame(go_bp_down)
+```
+
+```{r GO BP Top 10}
+top10_up <- go_bp_up_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Upregulated")
+
+top10_down <- go_bp_down_df %>%
+  arrange(p.adjust) %>%
+  slice_head(n = 10) %>%
+  mutate(direction = "Downregulated")
+
+go_top10_combined <- bind_rows(top10_up, top10_down)
+
+top10_GO_bp<- ggplot(go_top10_combined,
+             aes(x = reorder(Description, -log10(p.adjust)),
+                 y = -log10(p.adjust),
+                 fill = direction)) +
+        geom_col(width = 0.7) +
+        coord_flip() +
+        facet_wrap(~ direction, scales = "free_y") +
+        scale_fill_manual(values = c(
+          "Upregulated"   = "#C73E1D",
+          "Downregulated" = "#2A7FFF"
+        )) +
+        labs(
+          title = "Top 10 GO BP Terms in Up- and Downregulated Genes",
+          x = NULL,
+          y = expression(-log[10]("adjusted p-value")),
+          fill = NULL
+        ) +
+        theme_minimal(base_size = 14) +
+        theme(
+          panel.grid.major.y = element_blank(),
+          plot.title = element_text(face = "bold", hjust = 0.5)
+        )
+
+ggsave(
+  filename = file.path(out_dir_hypo, "GO_enrichment_BP_up_down_revised.png"),
+  plot = top10_GO_bp,
+  width = 16,
+  height = 8,
+  dpi = 300
+)
+```
+
+```{r clustering up and down}
+go_combined <- bind_rows(
+  go_bp_up_df %>% mutate(Direction = "Up"),
+  go_bp_down_df %>% mutate(Direction = "Down")
+)
+
+cluster_go_by_gene_overlap <- function(go_df, k = 10) {
+
+  go_long <- go_df %>%
+    dplyr::select(Description, geneID, p.adjust) %>%
+    tidyr::separate_rows(geneID, sep = "/")
+
+  go_gene_mat <- go_long %>%
+    distinct(Description, geneID) %>%
+    mutate(present = 1) %>%
+    tidyr::pivot_wider(
+      names_from = geneID,
+      values_from = present,
+      values_fill = 0
+    ) %>%
+    tibble::column_to_rownames("Description")
+
+  go_gene_mat <- go_gene_mat[rowSums(go_gene_mat) >= 3, ]
+
+  jaccard_dist <- proxy::dist(go_gene_mat, method = "Jaccard")
+  hc <- hclust(jaccard_dist, method = "average")
+  clusters <- cutree(hc, k = k)
+
+  cluster_df <- data.frame(
+    Description = names(clusters),
+    go_cluster = clusters,
+    stringsAsFactors = FALSE
+  )
+
+  list(
+    hc = hc,
+    clusters = cluster_df,
+    go_gene_mat = go_gene_mat
+  )
+}
+
+k <- 10
+up_clust   <- cluster_go_by_gene_overlap(go_bp_up_df,   k = k)
+down_clust <- cluster_go_by_gene_overlap(go_bp_down_df, k = k)
+
+```
+
+```{r}
+go_bp_up_df <- go_bp_up_df %>%
+  left_join(up_clust$clusters, by = "Description")
+
+go_bp_down_df <- go_bp_down_df %>%
+  left_join(down_clust$clusters, by = "Description")
+
+go_rep_up <- go_bp_up_df %>%
+  left_join(up_clust$clusters, by = "Description") %>%
+  group_by(go_cluster) %>%
+  slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+go_rep_down <- go_bp_down_df %>%
+  left_join(down_clust$clusters, by = "Description") %>%
+  group_by(go_cluster) %>%
+  slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+hc_up <- up_clust$hc
+ordered_terms_up <- rownames(up_clust$go_gene_mat)[hc_up$order]
+```
+
+
+```{r adding labels on the cluster}
+cluster_ordered_up <- data.frame(
+  Description = ordered_terms_up,
+  go_cluster = up_clust$clusters$go_cluster[
+    match(ordered_terms_up, up_clust$clusters$Description)
+  ],
+  x = seq_along(ordered_terms_up)
+)
+
+label_pos_up <- cluster_ordered_up %>%
+  group_by(go_cluster) %>%
+  summarise(x = mean(x), .groups = "drop") %>%
+  left_join(
+    go_rep_up %>% dplyr::select(go_cluster, Description),
+    by = "go_cluster"
+  )
+
+hc_down <- down_clust$hc
+ordered_terms_down <- rownames(down_clust$go_gene_mat)[hc_down$order]
+
+cluster_ordered_down <- data.frame(
+  Description = ordered_terms_down,
+  go_cluster = down_clust$clusters$go_cluster[
+    match(ordered_terms_down, down_clust$clusters$Description)
+  ],
+  x = seq_along(ordered_terms_down)
+)
+
+label_pos_down <- cluster_ordered_down %>%
+  group_by(go_cluster) %>%
+  summarise(x = mean(x), .groups = "drop") %>%
+  left_join(
+    go_rep_down %>% dplyr::select(go_cluster, Description),
+    by = "go_cluster"
+  )
+```
+
+
+
+```{r Plot figure and save}
+png(
+  file.path(out_dir_hypo,
+            "GO_term_clustering_gene_overlap_up_t_test.png"),
+  width = 15,
+  height = 8,
+  units = "in",
+  res = 300
+) 
+
+par(xpd = NA, mar = c(5, 5, 14, 5))
+
+plot(hc_up, labels = FALSE, main = "")
+rect.hclust(hc_up, k = k, border = "red")
+
+text(
+  x = label_pos_up$x,
+  y = max(hc_up$height) * 1.05,
+  labels = label_pos_up$Description,
+  srt = 35,
+  adj = 0,
+  cex = 0.9
+)
+
+dev.off()
+```
+
+
+```{r Plot figures for down GO BP}
+png(
+  file.path(out_dir_hypo,
+            "GO_term_clustering_gene_overlap_down_t_test.png"),
+  width = 15,
+  height = 8,
+  units = "in",
+  res = 300
+) 
+
+par(xpd = NA, mar = c(5, 5, 14, 11))
+
+plot(hc_down, labels = FALSE, main = "")
+rect.hclust(hc_down, k = k, border = "blue")
+
+text(
+  x = label_pos_down$x,
+  y = max(hc_down$height) * 1.05,
+  labels = label_pos_down$Description,
+  srt = 35,
+  adj = 0,
+  cex = 0.9
+)
+
+dev.off()
+```
