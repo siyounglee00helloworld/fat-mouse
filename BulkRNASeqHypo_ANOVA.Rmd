@@ -15,7 +15,7 @@ library(viridis); library(enrichplot)
 
 
 ```{r import read count matrix}
-count_hypo <- gene_count
+count_hypo <- read_count_bulk_hypo
 sample_info_hypo <- Sample_Information_Bulk_Hypothalamus_CHO
 ```
 
@@ -27,9 +27,9 @@ out_dir_hypo <- "output hypothalamus"
   "Post-weaning  HFHS-HFHS" = "#208696"
 )
 
-group_aes <- get_group_aesthetics(names(.group_base_colors))
-fill_map <- group_aes$fill
-color_map <- group_aes$color
+# group_aes <- get_group_aesthetics(names(.group_base_colors))
+# fill_map <- group_aes$fill
+# color_map <- group_aes$color
 
 group_order <- c("Chow-HFHS","Lactation HFHS-HFHS","Post-weaning  HFHS-HFHS")
 #write_xlsx(count_hypo, "read_count_bulk_hypo.xlsx")
@@ -265,6 +265,7 @@ expr_summary <- expr_leading %>%
   group_by(gene, group, Description) %>%
   summarise(mean_expr = mean(expression), .groups = "drop")
 ```
+
 ```{r}
 go_gene_mat <- leading_edge %>%
   distinct(Description, gene) %>%

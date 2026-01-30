@@ -3,15 +3,16 @@ title: "R Notebook"
 output: html_notebook
 ---
 ```{r}
-library(GOplot)
+library(GOplot);library(dplyr);library(tidyr);library(ggplot2)
 ```
 
 ```{r import read count matrix}
-count_hypo <- gene_count
+count_hypo <- read_count_bulk_hypo
 sample_info_hypo <- Sample_Information_Bulk_Hypothalamus_CHO
 ```
 
 ```{r}
+
 out_dir_hypo <- "output hypothalamus"
 .group_base_colors <- c(
   "Chow-HFHS" = "#000000",
@@ -19,9 +20,9 @@ out_dir_hypo <- "output hypothalamus"
   "Post-weaning  HFHS-HFHS" = "#208696"
 )
 
-group_aes <- get_group_aesthetics(names(.group_base_colors))
-fill_map <- group_aes$fill
-color_map <- group_aes$color
+# group_aes <- get_group_aesthetics(names(.group_base_colors))
+# fill_map <- group_aes$fill
+# color_map <- group_aes$color
 
 group_order <- c("Chow-HFHS","Lactation HFHS-HFHS","Post-weaning  HFHS-HFHS")
 #write_xlsx(count_hypo, "read_count_bulk_hypo.xlsx")
@@ -57,7 +58,6 @@ deg_down_lact_chow_t <- res_df_lact_chow %>%
 ```
 
 ```{r}
-
 # UP genes
 up_symbols <- rownames(deg_up_lact_chow_t)
 up_entrez <- bitr(
@@ -161,12 +161,15 @@ go_combined <- bind_rows(
   go_bp_down_df %>% mutate(Direction = "Down")
 )
 
-cluster_go_by_gene_overlap <- function(go_df, k = 10) {
+cluster_go_by_gene_overlap <- function(go_df, k = 10, min_genes = 3) {
 
+  # Long GO–gene table
   go_long <- go_df %>%
     dplyr::select(Description, geneID, p.adjust) %>%
-    tidyr::separate_rows(geneID, sep = "/")
+    tidyr::separate_rows(geneID, sep = "/") %>%
+    distinct()
 
+  # GO × gene binary matrix
   go_gene_mat <- go_long %>%
     distinct(Description, geneID) %>%
     mutate(present = 1) %>%
@@ -177,49 +180,61 @@ cluster_go_by_gene_overlap <- function(go_df, k = 10) {
     ) %>%
     tibble::column_to_rownames("Description")
 
-  go_gene_mat <- go_gene_mat[rowSums(go_gene_mat) >= 3, ]
+  # Filter weak GO terms
+  go_gene_mat <- go_gene_mat[rowSums(go_gene_mat) >= min_genes, , drop = FALSE]
 
+  # Clustering
   jaccard_dist <- proxy::dist(go_gene_mat, method = "Jaccard")
   hc <- hclust(jaccard_dist, method = "average")
   clusters <- cutree(hc, k = k)
 
-  cluster_df <- data.frame(
+  cluster_df <- tibble::tibble(
     Description = names(clusters),
-    go_cluster = clusters,
-    stringsAsFactors = FALSE
+    go_cluster  = as.integer(clusters)
   )
+
+  # 🔑 Join clusters BACK to gene-level table
+  go_long_clustered <- go_long %>%
+    inner_join(cluster_df, by = "Description")
 
   list(
     hc = hc,
-    clusters = cluster_df,
+    clusters = cluster_df,           # GO term → cluster
+    go_long  = go_long_clustered,     # GO term → gene → cluster
     go_gene_mat = go_gene_mat
   )
 }
 
 k <- 10
-up_clust   <- cluster_go_by_gene_overlap(go_bp_up_df,   k = k)
-down_clust <- cluster_go_by_gene_overlap(go_bp_down_df, k = k)
+go_bp_up_df   <- as_tibble(go_bp_up)
+go_bp_down_df <- as_tibble(go_bp_down)
+up_clust   <- cluster_go_by_gene_overlap(go_bp_up_df,   k = 10)
+down_clust <- cluster_go_by_gene_overlap(go_bp_down_df, k = 10)
+
 
 ```
 
 ```{r}
-go_bp_up_df <- go_bp_up_df %>%
-  left_join(up_clust$clusters, by = "Description")
+###ONLY ONCE
+# go_bp_up_df <- go_bp_up_df %>%
+#   left_join(up_clust$clusters, by = "Description")
+# 
+# go_bp_down_df <- go_bp_down_df %>%
+#   left_join(down_clust$clusters, by = "Description")
 
-go_bp_down_df <- go_bp_down_df %>%
-  left_join(down_clust$clusters, by = "Description")
 
 go_rep_up <- go_bp_up_df %>%
-  left_join(up_clust$clusters, by = "Description") %>%
+  filter(!is.na(go_cluster)) %>%
   group_by(go_cluster) %>%
   slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
   ungroup()
 
 go_rep_down <- go_bp_down_df %>%
-  left_join(down_clust$clusters, by = "Description") %>%
+  filter(!is.na(go_cluster)) %>%
   group_by(go_cluster) %>%
   slice_min(p.adjust, n = 1, with_ties = FALSE) %>%
   ungroup()
+
 
 hc_up <- up_clust$hc
 ordered_terms_up <- rownames(up_clust$go_gene_mat)[hc_up$order]
@@ -227,13 +242,17 @@ ordered_terms_up <- rownames(up_clust$go_gene_mat)[hc_up$order]
 
 
 ```{r adding labels on the cluster}
-cluster_ordered_up <- data.frame(
+ordered_terms_up <- rownames(up_clust$go_gene_mat)[up_clust$hc$order]
+
+cluster_ordered_up <- tibble(
   Description = ordered_terms_up,
-  go_cluster = up_clust$clusters$go_cluster[
-    match(ordered_terms_up, up_clust$clusters$Description)
-  ],
   x = seq_along(ordered_terms_up)
-)
+) %>%
+  left_join(
+    up_clust$clusters,
+    by = "Description"
+  )
+
 
 label_pos_up <- cluster_ordered_up %>%
   group_by(go_cluster) %>%
@@ -246,13 +265,15 @@ label_pos_up <- cluster_ordered_up %>%
 hc_down <- down_clust$hc
 ordered_terms_down <- rownames(down_clust$go_gene_mat)[hc_down$order]
 
-cluster_ordered_down <- data.frame(
+cluster_ordered_down <- tibble(
   Description = ordered_terms_down,
-  go_cluster = down_clust$clusters$go_cluster[
-    match(ordered_terms_down, down_clust$clusters$Description)
-  ],
   x = seq_along(ordered_terms_down)
-)
+) %>%
+  left_join(
+    down_clust$clusters,
+    by = "Description"
+  )
+
 
 label_pos_down <- cluster_ordered_down %>%
   group_by(go_cluster) %>%
@@ -261,11 +282,14 @@ label_pos_down <- cluster_ordered_down %>%
     go_rep_down %>% dplyr::select(go_cluster, Description),
     by = "go_cluster"
   )
+
 ```
 
 
 
 ```{r Plot figure and save}
+cluster_cols <- grDevices::hcl.colors(k, palette = "Dark 3")
+
 png(
   file.path(out_dir_hypo,
             "GO_term_clustering_gene_overlap_up_t_test.png"),
@@ -275,10 +299,17 @@ png(
   res = 300
 ) 
 
-par(xpd = NA, mar = c(5, 5, 14, 5))
+par(xpd = NA, mar = c(5, 5, 16, 4))
 
 plot(hc_up, labels = FALSE, main = "")
-rect.hclust(hc_up, k = k, border = "red")
+
+clust_assign <- cutree(hc_up, k = k)
+ordered_clusters <- clust_assign[hc_up$order]
+cluster_order_lr <- unique(ordered_clusters)
+rect_cols <- cluster_cols[cluster_order_lr]
+rect.hclust(hc_up, k = k, border = rect_cols)
+
+label_pos_up$col <- cluster_cols[label_pos_up$go_cluster]
 
 text(
   x = label_pos_up$x,
@@ -286,7 +317,9 @@ text(
   labels = label_pos_up$Description,
   srt = 35,
   adj = 0,
-  cex = 0.9
+  cex = 0.9,
+  col = label_pos_up$col,
+  font = 2 
 )
 
 dev.off()
@@ -318,4 +351,471 @@ text(
 )
 
 dev.off()
+```
+
+
+```{r Plot Genes}
+# --- UP clusters ---
+top_genes_up <- go_bp_up_df %>%
+  tidyr::separate_rows(geneID, sep = "/") %>%
+  group_by(go_cluster, geneID) %>%
+  summarise(freq = n(), .groups = "drop") %>%
+  group_by(go_cluster) %>%
+  slice_max(freq, n = 3, with_ties = FALSE) %>%
+  ungroup()
+
+
+top_genes_up
+
+# --- DOWN clusters ---
+top_genes_down <- go_bp_down_df %>%
+  tidyr::separate_rows(geneID, sep = "/") %>%
+  group_by(go_cluster, geneID) %>%
+  summarise(freq = n(), .groups = "drop") %>%
+  group_by(go_cluster) %>%
+  slice_max(freq, n = 3, with_ties = FALSE) %>%
+  ungroup()
+
+
+top_genes_down
+top_genes_up_expr <- top_genes_up %>%
+  left_join(deg_up_lact_chow_t %>% 
+              tibble::rownames_to_column("geneID") %>%
+              dplyr::select(geneID, log2FoldChange), 
+            by = "geneID")
+
+top_genes_down_expr <- top_genes_down %>%
+  left_join(deg_down_lact_chow_t %>% 
+              tibble::rownames_to_column("geneID") %>%
+              dplyr::select(geneID, log2FoldChange), 
+            by = "geneID")
+
+# Combine Up/Down if desired
+top_genes_all <- bind_rows(
+  top_genes_up_expr %>% mutate(Direction = "Up"),
+  top_genes_down_expr %>% mutate(Direction = "Down")
+)
+
+ggplot(top_genes_all, aes(x = factor(go_cluster), y = geneID, size = freq, color = log2FoldChange)) +
+  geom_point(alpha = 1) +   # fully opaque
+  scale_color_gradient2(
+    low = "red",       # vivid blue
+    mid = "yellow",
+    high = "blue",      # vivid red
+    midpoint = 0.0
+  ) +
+  scale_size_continuous(range = c(4, 10)) +                               # horizontal labels
+  facet_wrap(~Direction, scales = "free_y") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(face = "bold", color = "black"),
+    axis.text.x = element_text(face = "bold"),
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.grid.major = element_line(color = "grey80"),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    x = "GO Cluster",
+    y = "Top Genes",
+    size = "Frequency",
+    color = "log2FC"
+  )
+
+ggsave(file.path(out_dir_hypo, "GO_Cluster_Up_Down_top3_genes.png"), width = 8, height = 7)
+
+```
+
+
+
+
+```{r}
+cluster_cols <- grDevices::hcl.colors(k, palette = "Dark 3")
+names(cluster_cols) <- as.character(1:k)
+
+expr_long_filt <- expr_long %>%
+  dplyr::filter(!is.na(go_cluster)) %>%
+  dplyr::filter(Direction == "Up")
+
+ggplot(expr_long_filt, aes(x = group, y = geneID)) +
+
+  # --- GO CLUSTER ANNOTATION BAR (left) ---
+  geom_tile(
+    aes(x = 0.35, fill = factor(go_cluster)),
+    width = 0.3,
+    color = NA
+  ) +
+  scale_fill_manual(
+    values = cluster_cols,
+    guide = "none"
+  ) +
+
+  ggnewscale::new_scale_fill() +
+
+  # --- MAIN HEATMAP ---
+  geom_tile(
+    aes(fill = Zscore),
+    color = "grey85",
+    width = 0.9,
+    height = 0.9
+  ) +
+
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Z-score"
+  ) +
+
+  facet_wrap(~Direction, scales = "free_y") +
+
+  scale_x_discrete(expand = expansion(add = c(0.6, 0))) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid = element_blank(),
+    legend.position = "top"
+  ) +
+
+  labs(
+    x = "Experimental Group",
+    y = "Top genes (top 3 per GO cluster)",
+    fill = "Z-score"
+  ) +
+
+  coord_cartesian(clip = "off")
+
+ggsave(file.path(out_dir_hypo, "GO_Cluster_Up_Heatmap.png"), width = 7, height =5)
+```
+
+
+```{r}
+group_colors <- c(
+  "Chow-HFHS" = "#000000",
+  "Lactation HFHS-HFHS" = "#de5528",
+  "Post-weaning  HFHS-HFHS" = "#208696"
+)
+
+
+# Order genes by cluster and Direction
+expr_long_filt <- expr_long_filt %>%
+  dplyr::filter(!is.na(go_cluster)) %>%
+  mutate(
+    group = factor(group, levels = names(group_colors))
+  )
+
+# Order samples by group
+sample_order <- expr_long_filt %>%
+  distinct(Sample, group) %>%
+  mutate(group = factor(group, levels = group_order)) %>%
+  arrange(group) %>%
+  pull(Sample)
+
+expr_long_filt$Sample <- factor(expr_long_filt$Sample, levels = sample_order)
+top_bar$Sample <- factor(top_bar$Sample, levels = sample_order)
+
+# Order genes by Direction and GO cluster for y-axis
+gene_order <- expr_long_filt %>%
+  arrange(Direction, go_cluster, geneID) %>%
+  pull(geneID) %>%
+  unique()
+
+expr_long_filt$geneID <- factor(expr_long_filt$geneID, levels = rev(gene_order))  # reverse for plotting top-down
+
+# Precompute y-position for top group bar
+y_top_bar <- length(levels(expr_long_filt$geneID)) + 0.5
+
+top_bar <- expr_long_filt %>%
+  distinct(Sample, group) %>%
+  mutate(y = y_top_bar)
+
+ggplot(expr_long_filt, aes(x = Sample, y = geneID)) +
+
+  # --- Top group annotation bar ---
+  geom_tile(
+    data = top_bar,
+    aes(x = Sample, y = y, fill = group),
+    height = 0.3
+  ) +
+  scale_fill_manual(values = group_colors, name = "Experimental Group") +
+
+  ggnewscale::new_scale_fill() +
+
+  # --- Left GO cluster annotation ---
+  geom_tile(
+    aes(x = 0.35, fill = factor(go_cluster)),
+    width = 0.3,
+    color = NA
+  ) +
+  scale_fill_manual(values = cluster_cols, guide = "none") +
+
+  ggnewscale::new_scale_fill() +
+
+  # --- Main heatmap ---
+  geom_tile(
+    aes(fill = Zscore),
+    color = "grey85",
+    width = 0.9,
+    height = 0.9
+  ) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Z-score"
+  ) +
+
+  facet_wrap(~Direction, scales = "free_y") +
+
+  scale_x_discrete(expand = expansion(add = c(0.6, 0))) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(face = "bold", angle = 45, hjust = 1),
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid = element_blank(),
+    legend.position = "top",
+    plot.margin = margin(t = 20, r = 10, b = 10, l = 10)
+  ) +
+
+  labs(
+    x = "Samples",
+    y = "Top genes (top 3 per GO cluster)"
+  ) +
+
+  coord_cartesian(clip = "off") +
+  scale_y_discrete(limits = rev(levels(expr_long_filt$geneID)))  # keep top-down order
+
+
+ggsave(file.path(out_dir_hypo, "GO_Cluster_Up_Heatmap_with_Samples.png"), width = 8, height =5)
+```
+
+```{r}
+cluster_summary_table <- label_pos_up %>%
+  dplyr::select(go_cluster, Description) %>%
+  distinct() %>%
+  mutate(
+    color = cluster_cols[as.character(go_cluster)]
+  ) 
+
+legend_df <- cluster_summary_table %>%
+  mutate(
+    go_cluster = factor(go_cluster, levels = go_cluster)
+  )
+
+ggplot(legend_df, aes(x = 1, y = go_cluster, fill = go_cluster)) +
+  geom_tile(width = 0.4, height = 0.8) +
+  scale_fill_manual(values = cluster_cols) +
+  geom_text(
+    aes(label = Description),
+    hjust = 0,
+    x = 1.3,
+    size = 4,
+    fontface = "bold"
+  ) +
+  coord_cartesian(xlim = c(0.9, 6), clip = "off") +
+  theme_void() +
+  theme(legend.position = "none")
+
+ggsave(file.path(out_dir_hypo, "GO_Cluster_Up_Heatmap_legend.png"), width = 6, height =5)
+```
+
+
+```{r let's look at cluster 7}
+library(DESeq2)
+library(tidyverse)
+library(ggnewscale)
+
+
+go_terms_cluster7 <- cluster_ordered_up %>%
+  filter(go_cluster == 7) %>%
+  pull(Description)
+
+genes_cluster7 <- up_clust$go_long %>%
+  filter(go_cluster == 7) %>%
+  pull(geneID) %>%
+  unique()
+
+count_cluster7 <- count_hypo_filtered[
+  rownames(count_hypo_filtered) %in% genes_cluster7,
+  ,
+  drop = FALSE
+]
+
+
+expr_long_cluster7 <- as.data.frame(count_cluster7) %>%
+  tibble::rownames_to_column("geneID") %>%
+  pivot_longer(
+    cols = -geneID,
+    names_to = "Sample",
+    values_to = "Expression"
+  ) %>%
+  left_join(sample_info_hypo, by = c("Sample" = "sample_name")) %>%
+  mutate(group = factor(group, levels = group_order))
+
+expr_long_cluster7 <- expr_long_cluster7 %>%
+  group_by(geneID) %>%
+  mutate(
+    Zscore = ifelse(
+      sd(Expression) == 0,
+      0,
+      (Expression - mean(Expression)) / sd(Expression)
+    )
+  ) %>%
+  ungroup()
+
+gene_order <- expr_long_cluster7 %>%
+  group_by(geneID) %>%
+  summarise(mean_z = mean(Zscore), .groups = "drop") %>%
+  arrange(mean_z) %>%
+  pull(geneID)
+
+sample_order <- expr_long_cluster7 %>%
+  distinct(Sample, group) %>%
+  arrange(group) %>%
+  pull(Sample)
+
+expr_long_cluster7 <- expr_long_cluster7 %>%
+  mutate(
+    geneID = factor(geneID, levels = gene_order),
+    Sample = factor(Sample, levels = sample_order)
+  )
+
+
+
+# --- Step 6: Prepare top annotation bar ---
+top_bar <- expr_long_cluster7 %>%
+  distinct(Sample, group) %>%
+  mutate(y = top_bar_level)
+
+ggplot(expr_long_cluster7, aes(x = Sample, y = geneID)) +
+  geom_tile(aes(fill = Zscore), color = "grey85", width = 0.9, height = 0.9) +
+  scale_fill_gradient2(
+    low = "#2166AC",
+    mid = "white",
+    high = "#B2182B",
+    midpoint = 0,
+    name = "Z-score"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.y = element_text(face = "bold", size = 9),
+    axis.text.x = element_text(face = "bold", angle = 45, hjust = 1),
+    panel.grid = element_blank(),
+    legend.position = "top"
+  ) +
+  labs(
+    x = "Samples",
+    y = "Genes driving GO cluster 7"
+  ) +
+  coord_cartesian(clip = "off")
+
+```
+
+```{r}
+# Step 1: Compute Z-score per gene across all samples
+expr_long_cluster7 <- expr_long_cluster7 %>%
+  group_by(geneID) %>%
+  mutate(Zscore = (Expression - mean(Expression)) / sd(Expression)) %>%
+  ungroup()
+
+# Step 2: Compute mean Z-score per gene per group
+expr_group_mean <- expr_long_cluster7 %>%
+  group_by(geneID, group) %>%
+  summarize(MeanZ = mean(Zscore, na.rm = TRUE), .groups = "drop")
+
+# Step 3: Convert to matrix (genes x groups)
+expr_matrix <- expr_group_mean %>%
+  pivot_wider(names_from = group, values_from = MeanZ) %>%
+  column_to_rownames("geneID") %>%
+  as.matrix()
+
+# Step 4: Fix column order to match group_order
+expr_matrix <- expr_matrix[, group_order, drop = FALSE]
+
+# Step 4: Custom color palette
+my_colors <- colorRampPalette(c("#1b9e77", "yellow", "red"))(100)
+# Step 6: Output PNG
+out_file <- file.path(out_dir_hypo, "Cluster7_ER_Stress_heatmap_group_means.png")
+
+png(filename = out_file,
+    width = 1300,
+    height = 1200,
+    res = 150)
+
+pheatmap(
+  expr_matrix,
+  scale = "none",        # Already Z-scored
+  cluster_rows = TRUE,   # Cluster genes
+  cluster_cols = FALSE,  # Keep group order
+  color = my_colors,
+  border_color = "grey85",
+  fontsize_row = 9,
+  fontsize_col = 12,
+  angle_col = 0,
+  main = "Genes Driving ER Stress (Cluster 7) Across Groups"
+)
+
+dev.off()
+```
+
+```{r Cluster 7 across all samples}
+expr_matrix_samples <- expr_long_cluster7 %>%
+  dplyr::select(geneID, Sample, Zscore) %>%
+  pivot_wider(names_from = Sample, values_from = Zscore) %>%
+  column_to_rownames("geneID") %>%
+  as.matrix()
+
+# Step 3: Prepare column annotation (groups)
+col_annotation <- expr_long_cluster7 %>%
+  distinct(Sample, group) %>%
+  column_to_rownames("Sample")
+
+# Optional: reorder columns by group
+sample_order_fixed <- col_annotation %>%
+  arrange(group) %>%
+  rownames()
+
+expr_matrix_samples <- expr_matrix_samples[, sample_order_fixed]
+col_annotation <- col_annotation[sample_order_fixed, , drop = FALSE]
+
+# Step 4: Same color palette
+my_colors <- colorRampPalette(c("#1b9e77", "yellow", "red"))(100)
+
+# Step 5: Define annotation colors
+group_colors <- setNames(RColorBrewer::brewer.pal(n = length(unique(col_annotation$group)), name = "Set2"),
+                         unique(col_annotation$group))
+
+ann_colors <- list(group = group_colors)
+
+# Step 6: Output PNG
+out_file_samples <- file.path(out_dir_hypo, "Cluster7_ER_Stress_heatmap_all_samples_annot.png")
+
+png(filename = out_file_samples,
+    width = 1600,
+    height = 1200,
+    res = 150)
+
+pheatmap(
+  expr_matrix_samples,
+  scale = "none",             # Already Z-scored
+  cluster_rows = TRUE,        # Cluster genes
+  cluster_cols = FALSE,       # Keep sample order
+  color = my_colors,
+  border_color = "grey85",
+  fontsize_row = 8,
+  fontsize_col = 9,
+  angle_col = 45,
+  main = "Genes Driving ER Stress (Cluster 7) Across Samples",
+  annotation_col = col_annotation,
+  annotation_colors = ann_colors
+)
+
+dev.off()
+
 ```
